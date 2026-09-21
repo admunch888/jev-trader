@@ -13,6 +13,7 @@
   "dependencies": {
     "@ai-sdk/typesafe-ai": "^3.0.0",
     "@kuru-labs/kuru-sdk": "^0.0.95",
+    "@stoqey/ib": "^1.6.10",
     "ai": "^7.0.103",
     "ethers": "5"
   },
