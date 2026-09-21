@@ -70,7 +70,7 @@ Every `FUT_DECISION_S` seconds, per root (roots are staggered across the interva
 1. Bookkeeping: expire orders stuck without a final status, roll to the next contract once flat past the roll date, start a new trading day's PnL at the 17:00 Chicago open, reconcile with the broker every `FUT_RECONCILE_CYCLES` (adopting the broker's position if they disagree).
 2. Read the book from memory and work out the risk gates.
 3. Unless a gate already decides (halted, roll, weekend, stop breached, session closed), ask the model buy or sell for the next `FUT_HORIZON_MIN` minutes. No answer within `FUT_MODEL_TIMEOUT_MS` means hold.
-4. Target position from the probability of up: long at `FUT_ENTER_PROB` or above, short at `1 - FUT_ENTER_PROB` or below, flat within `FUT_FLAT_BAND` of 50/50, otherwise keep. Hysteresis keeps a wavering model from churning.
+4. Target position from the probability of up, averaged over the last `FUT_SMOOTH_N` answers (default 2; nothing happens until that many consecutive answers exist): long at `FUT_ENTER_PROB` or above, short at `1 - FUT_ENTER_PROB` or below, flat within `FUT_FLAT_BAND` of 50/50, otherwise keep. Then two anti-churn rules: a signal against the position goes flat first and the other side needs its own signal on a later cycle (`FUT_ALLOW_FLIP=false`), and the model cannot shrink or reverse a position younger than `FUT_MIN_HOLD_MIN` (default the 5 minute horizon). Risk gates and the stop can always close it. Every model call, with its full input and answer, goes to `data/futures-decisions.jsonl`.
 5. Risk gates can only move the target toward flat:
 
 | Gate | Effect |
@@ -91,7 +91,7 @@ Position and PnL come from fills (with real commissions on IBKR). An order count
 
 ## Running
 
-    bun run test:futures                        # 53 tests, no broker needed
+    bun run test:futures                        # 60 tests, no broker needed
     FUT_ROOTS=MES,MNQ,ZB bun run futures        # sim: real quotes, simulated fills
     FUT_EXEC=ibkr bun run futures               # orders to the IBKR paper account on IB_PORT
     MODEL=jev TYPESAFE_AI_API_KEY=... bun run futures   # Jev instead of the mock
@@ -122,6 +122,14 @@ Both write `data/ticks/<ROOT>/<CODE>/<trading day>.jsonl` (format in `backtest/f
 | `--stale` | 120 s | Skip a cycle when the contract's last quote is older (data gaps, missing files). |
 | `--decision-s --horizon-min --enter --flat-band --qty --max-contracts --stop-ticks --daily-loss --max-spread --slip-ticks` | FUT_* | Strategy overrides. |
 | `--confirm-jev` | | Required with `MODEL=jev`: every cycle is a paid call (about 2,760 per root per trading day at 30 s). |
+
+**Tuning the policy on the model's real answers.** `--replay data/futures-decisions.jsonl` feeds the backtester the answers the live model already gave instead of calling it (free, no lookahead: at each cycle it uses the latest answer made at or before that moment, and holds if none is under two intervals old). Run it over the ticks recorded during the same session and compare settings:
+
+    bun run backtest --replay data/futures-decisions.jsonl --latency 400 --smooth 1 --min-hold 0 --allow-flip   # act on every answer
+    bun run backtest --replay data/futures-decisions.jsonl --latency 400                                          # defaults
+    bun run backtest --replay data/futures-decisions.jsonl --latency 400 --enter 0.7 --smooth 3 --min-hold 10
+
+It answers "which settings make the most of this model's calls after costs". It cannot tell you how the model would have answered different inputs; changing the model's inputs or question needs a new live session.
 
 **3. Read it.** The console prints net PnL (realized, open, fees), round trips, win rate, profit factor, expectancy, hold time, max drawdown, daily Sharpe (5+ days), gate counts and a buy and hold comparison per root. `data/backtests/<time>/` gets `summary.json`, `trades.csv` (one row per flat-to-flat round trip), `equity.csv` (after every cycle) and `cycles.jsonl` (every decision, as the live `/events` stream).
 

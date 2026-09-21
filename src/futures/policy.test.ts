@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { clampTarget, RiskGuard, targetFromProbability, type Gates } from "./policy";
+import { clampTarget, RiskGuard, shapeTarget, smoothed, targetFromProbability, type Gates } from "./policy";
 
 const P = { enterProb: 0.6, flatBand: 0.05, qty: 1 };
 const open: Gates = { brokerDown: false, halted: false, roll: false, weekend: false, stopBreached: false, closed: false, noNewRisk: [], maxContracts: 2 };
@@ -39,6 +39,29 @@ describe("clampTarget", () => {
 
   test("max contracts", () => {
     expect(clampTarget(-3, 0, open)).toEqual({ target: -2, gate: "max-contracts" });
+  });
+});
+
+describe("anti-churn shaping", () => {
+  test("average of the last n readings, none until there are n", () => {
+    expect(smoothed([0.9], 2)).toBeNull();
+    expect(smoothed([0.2, 0.9, 0.5], 2)).toBeCloseTo(0.7, 9);
+    expect(smoothed([0.8], 1)).toBe(0.8);
+  });
+
+  const o = { allowFlip: false, heldMs: 10 * 60_000, minHoldMs: 5 * 60_000 };
+  test("no flips: the other side goes flat first", () => {
+    expect(shapeTarget(-1, 1, o)).toEqual({ target: 0, shape: "no-flip" });
+    expect(shapeTarget(-1, 1, { ...o, allowFlip: true })).toEqual({ target: -1, shape: null });
+    expect(shapeTarget(-1, 0, o)).toEqual({ target: -1, shape: null }); // from flat is an entry, not a flip
+  });
+
+  test("min hold keeps a young position, but lets it be added to", () => {
+    const young = { ...o, heldMs: 60_000 };
+    expect(shapeTarget(0, 1, young)).toEqual({ target: 1, shape: "min-hold" });
+    expect(shapeTarget(-1, 1, young)).toEqual({ target: 1, shape: "min-hold" });
+    expect(shapeTarget(2, 1, young)).toEqual({ target: 2, shape: null });
+    expect(shapeTarget(0, 1, o)).toEqual({ target: 0, shape: null }); // held long enough
   });
 });
 

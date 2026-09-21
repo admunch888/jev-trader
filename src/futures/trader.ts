@@ -3,11 +3,13 @@ import type { Action, Model } from "../model";
 import type { FuturesConfig } from "./config";
 import { pnlUsd, roundToTick, SPECS } from "./contracts";
 import type { FuturesTradeState } from "./model";
-import { clampTarget, RiskGuard, targetFromProbability, type Gate, type Gates } from "./policy";
+import { clampTarget, RiskGuard, shapeTarget, smoothed, targetFromProbability, type Gate, type Gates, type Shape } from "./policy";
 import type { BookSnapshot, ContractSpec, ExecFill, Execution, FuturesContract, MarketData, OrderState, OrderUpdate, Print, Root, Side } from "./types";
 
 export interface FuturesEvent {
   root: Root;
+  /** The model that made this cycle's decision ("mock", a Jev id, "replay"). */
+  model: string;
   contract: string;
   ts: number;
   cycle: number;
@@ -16,13 +18,17 @@ export interface FuturesEvent {
   mid: number | null;
   spreadTicks: number | null;
   delayed: boolean;
-  /** Null when the model was not asked (a gate already decided, no quote) or did not answer in time. */
-  decision: { action: Action; probabilities: Record<Action, number>; latencyMs: number; late: boolean } | null;
-  /** Position the model's answer asked for, before risk gates. */
+  /**
+   * Null when the model was not asked (a gate already decided, no quote) or did not answer in time. `upUsed` is the
+   * averaged up-probability the policy acted on (null until `smoothN` readings exist).
+   */
+  decision: { action: Action; probabilities: Record<Action, number>; latencyMs: number; late: boolean; upUsed?: number | null } | null;
+  /** Position the model's (averaged) answer asked for, before the no-flip, min-hold and risk rules. */
   wanted: number | null;
-  /** Position after risk gates; an order is sent when it differs from the current one. */
+  /** Position after those rules; an order is sent when it differs from the current one. */
   target: number | null;
-  gate: Gate | null;
+  /** What changed the target: a risk gate, or a policy rule (confirm, no-flip, min-hold). */
+  gate: Gate | Shape | null;
   gateDetail?: string;
   order: { ref: string; side: Side; qty: number; price: number } | null;
   position: { qty: number; avgPrice: number | null; unrealizedUsd: number };
@@ -48,6 +54,18 @@ export interface Totals {
   pnlTodayUsd: number;
 }
 
+/** One model call: exactly what it was given and what it answered. Written to data/futures-decisions.jsonl live, and replayable by the backtester. */
+export interface DecisionRecord {
+  ts: number;
+  root: Root;
+  contract: string;
+  model: string;
+  state: FuturesTradeState;
+  probabilities: Record<Action, number>;
+  action: Action;
+  latencyMs: number;
+}
+
 export interface TraderDeps {
   root: Root;
   md: MarketData;
@@ -60,6 +78,7 @@ export interface TraderDeps {
   now?: () => Date;
   onEvent?: (e: FuturesEvent) => void;
   onFill?: (f: ExecFill, e: { root: Root; qty: number; avgPrice: number | null }) => void;
+  onDecision?: (r: DecisionRecord) => void;
   log?: (msg: string) => void;
 }
 
@@ -107,6 +126,10 @@ export class FuturesTrader {
   private cycleNo = 0;
   private refSeq = 0;
   private pos = { qty: 0, avg: 0 };
+  /** When the current position was opened (or reversed); drives the minimum hold. */
+  private openedAt: number | null = null;
+  /** The model's recent up-probabilities from consecutive cycles, for `smoothN`. */
+  private readings: number[] = [];
   private mids: { ts: number; mid: number }[] = [];
   private prints: Print[] = [];
   private orders = new Map<string, Tracked>();
@@ -189,16 +212,34 @@ export class FuturesTrader {
 
     const gates = this.gates(now, book);
     const forced = gates.brokerDown || gates.halted || gates.roll || gates.weekend || gates.stopBreached || gates.closed;
+    const cfg = this.d.cfg;
     let decision: FuturesEvent["decision"] = null;
     let wanted: number | null = null;
+    let shaped = this.pos.qty;
+    let shape: Shape | null = null;
     if (!forced) {
-      const d = await this.decide(this.buildState(now, book, gates));
+      const state = this.buildState(now, book, gates);
+      const d = await this.decide(state);
       if (d) {
-        decision = { action: d.action, probabilities: d.probabilities, latencyMs: Math.round(d.latencyMs), late: false };
-        wanted = targetFromProbability(d.probabilities.buy, this.pos.qty, this.d.cfg);
-      } else notes.push("model gave no answer in time; holding");
-    }
-    const { target, gate, detail } = clampTarget(wanted ?? this.pos.qty, this.pos.qty, gates);
+        this.d.onDecision?.({ ts: now.getTime(), root: this.d.root, contract: this.contract.code, model: this.d.model.name, state, probabilities: d.probabilities, action: d.action, latencyMs: Math.round(d.latencyMs) });
+        this.readings.push(d.probabilities.buy);
+        if (this.readings.length > Math.max(1, cfg.smoothN)) this.readings.shift();
+        const up = smoothed(this.readings, Math.max(1, cfg.smoothN));
+        decision = { action: d.action, probabilities: d.probabilities, latencyMs: Math.round(d.latencyMs), late: false, upUsed: up === null ? null : round(up, 4) };
+        if (up === null) shape = "confirm"; // not enough consecutive readings yet: hold
+        else {
+          wanted = targetFromProbability(up, this.pos.qty, cfg);
+          const heldMs = this.openedAt === null ? null : now.getTime() - this.openedAt;
+          ({ target: shaped, shape } = shapeTarget(wanted, this.pos.qty, { allowFlip: cfg.allowFlip, heldMs, minHoldMs: cfg.minHoldMinutes * 60_000 }));
+        }
+      } else {
+        this.readings = [];
+        notes.push("model gave no answer in time; holding");
+      }
+    } else this.readings = []; // readings must be consecutive
+    const clamped = clampTarget(shaped, this.pos.qty, gates);
+    const { target, detail } = clamped;
+    const gate = clamped.gate ?? shape;
 
     let order: FuturesEvent["order"] = null;
     if (target !== this.pos.qty) {
@@ -364,6 +405,7 @@ export class FuturesTrader {
   private applyFill(f: ExecFill) {
     const signed = f.side === "buy" ? f.qty : -f.qty;
     const p = this.pos;
+    const before = p.qty;
     if (!p.qty || Math.sign(p.qty) === Math.sign(signed)) {
       p.avg = (p.avg * Math.abs(p.qty) + f.price * f.qty) / (Math.abs(p.qty) + f.qty);
       p.qty += signed;
@@ -376,6 +418,13 @@ export class FuturesTrader {
     }
     this.totals.feesUsd += f.commission ?? this.spec.estFeesPerSide * f.qty;
     this.totals.fills++;
+    this.markOpened(before, p.qty);
+  }
+
+  /** A position that starts from flat, or reverses, starts its minimum hold now; going flat clears it. */
+  private markOpened(before: number, after: number) {
+    if (!after) this.openedAt = null;
+    else if (!before || Math.sign(before) !== Math.sign(after)) this.openedAt = this.now().getTime();
   }
 
   // ---------------------------------------------------------------------------------------------------------
@@ -400,6 +449,7 @@ export class FuturesTrader {
       const msg = `${reason} reconcile: broker ${bq} ${this.contract.code} @ ${broker?.avgPrice ?? "-"}, ours ${this.pos.qty}; adopting broker`;
       this.log(msg);
       notes.push(msg);
+      this.markOpened(this.pos.qty, bq);
       this.pos = { qty: bq, avg: bq ? broker!.avgPrice : 0 };
     }
   }
@@ -433,6 +483,7 @@ export class FuturesTrader {
     this.contract = next;
     this.mids = [];
     this.prints = [];
+    this.readings = [];
     await this.attach();
     notes.push(`rolled ${old.code} -> ${next.code}`);
     this.log(`rolled ${old.code} -> ${next.code}`);
@@ -538,12 +589,12 @@ export class FuturesTrader {
 
   private emit(p: {
     book: BookSnapshot | null; notes: string[]; late?: boolean;
-    decision?: FuturesEvent["decision"]; wanted?: number | null; target?: number | null; gate?: Gate | null; gateDetail?: string; order?: FuturesEvent["order"];
+    decision?: FuturesEvent["decision"]; wanted?: number | null; target?: number | null; gate?: Gate | Shape | null; gateDetail?: string; order?: FuturesEvent["order"];
   }) {
     const b = p.book;
     const stop = this.workingStop();
     const e: FuturesEvent = {
-      root: this.d.root, contract: this.contract.code, ts: this.now().getTime(), cycle: this.cycleNo,
+      root: this.d.root, model: this.d.model.name, contract: this.contract.code, ts: this.now().getTime(), cycle: this.cycleNo,
       bid: b?.bid ?? null, ask: b?.ask ?? null, mid: b?.mid ?? null, spreadTicks: b?.spreadTicks ?? null, delayed: b?.delayed ?? false,
       decision: p.late ? { action: "hold", probabilities: { buy: 0, sell: 0, hold: 1 }, latencyMs: 0, late: true } : p.decision ?? null,
       wanted: p.wanted ?? null, target: p.target ?? null, gate: p.gate ?? null,

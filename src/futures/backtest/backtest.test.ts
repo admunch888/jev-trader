@@ -11,6 +11,7 @@ import type { ExecFill, OrderUpdate } from "../types";
 import { runBacktest, type BacktestOptions } from "./engine";
 import { indexTicks, pageTicks, readTickFile, spreadWithinSecond, tickPath, TickWriter } from "./format";
 import { mergeStreams } from "./replay";
+import { LoggedModel, loadDecisions } from "./logged";
 import { maxDrawdown, roundTrips, summarize } from "./report";
 import { generateSynthetic } from "./synth";
 
@@ -28,6 +29,7 @@ class ConstModel implements Model<FuturesTradeState> {
 
 const cfg: FuturesConfig = {
   ...futuresConfig, roots: ["MES"], decisionSeconds: 30, horizonMinutes: 5, qty: 1, maxContracts: 1, enterProb: 0.6, flatBand: 0.05,
+  smoothN: 1, minHoldMinutes: 0, allowFlip: true,
   slipTicks: 0, maxSpreadTicks: 2, stopTicks: () => 16, dailyLossUsd: 10_000, entryCutoffMinutes: 10, flattenBeforeWeekendMinutes: 15,
   reconcileEveryCycles: 1_000, orderTimeoutMs: 30_000, depthRows: 0,
 };
@@ -148,6 +150,37 @@ describe("report", () => {
   });
 });
 
+describe("replaying logged model answers", () => {
+  const dec = (ts: number, up: number) => ({ ts, root: "MES" as const, up, latencyMs: 100 });
+
+  test("reads both log formats, skips late cycles, counts a decision once", async () => {
+    const dir = tmp();
+    const events = join(dir, "events.jsonl"), decisions = join(dir, "decisions.jsonl");
+    writeFileSync(events, [
+      { root: "MES", ts: 1000, decision: { probabilities: { buy: 0.8 }, latencyMs: 90, late: false } },
+      { root: "MES", ts: 2000, decision: { probabilities: { buy: 0 }, late: true } },
+      { root: "MES", ts: 3000, decision: null },
+      { root: "MES", ts: 5000, model: "mock", decision: { probabilities: { buy: 0.9 }, late: false } },
+    ].map((x) => JSON.stringify(x)).join("\n"));
+    writeFileSync(decisions, JSON.stringify({ root: "MES", ts: 1000, probabilities: { buy: 0.8 }, latencyMs: 90, state: {} }) + "\n" +
+      JSON.stringify({ root: "MES", ts: 4000, probabilities: { buy: 0.3 }, latencyMs: 80, state: {} }));
+    expect(await loadDecisions([events, decisions])).toEqual([dec(1000, 0.8), dec(4000, 0.3)].map((d) => ({ ...d, latencyMs: d.ts === 1000 ? 90 : 80 })));
+  });
+
+  test("never looks ahead, and has no answer when the log is stale", async () => {
+    let now = 0;
+    const m = new LoggedModel([dec(1000, 0.8), dec(31_000, 0.2)], () => now, 60_000);
+    const state = { root: "MES" } as never;
+    now = 500; await expect(m.decide(state)).rejects.toThrow(); // before the first answer
+    now = 30_999; expect((await m.decide(state)).probabilities.buy).toBe(0.8); // not the one at 31 s yet
+    now = 31_000; expect((await m.decide(state)).probabilities.buy).toBe(0.2);
+    now = 91_001; await expect(m.decide(state)).rejects.toThrow(); // over 60 s old
+    expect([m.hits, m.misses]).toEqual([2, 2]);
+  });
+});
+
+const dec = (ts: number, up: number) => ({ ts, root: "MES" as const, up, latencyMs: 100 });
+
 describe("runBacktest", () => {
   /** MES quotes every second from T0, rising one tick every 10 s, one-tick spread. Optional gap. */
   function trendDay(dir: string, minutes: number, gap?: { fromMin: number; toMin: number }) {
@@ -183,6 +216,20 @@ describe("runBacktest", () => {
     // One tick of slippage allowance catches it.
     const slipped = await runBacktest(base(dir, { cfg: { ...cfg, slipTicks: 1 } }));
     expect(slipped.fills[0]!.fill).toMatchObject({ price: 5701.75, ts: T0 + 60_250 });
+  });
+
+  test("replays logged answers through the full loop", async () => {
+    const dir = tmp();
+    trendDay(dir, 30);
+    // Logged answers every 30 s: bullish for 10 minutes, then bearish.
+    const logged = Array.from({ length: 58 }, (_, i) => dec(T0 + 60_000 + i * 30_000, i < 20 ? 0.9 : 0.1));
+    let model: LoggedModel | null = null;
+    const r = await runBacktest({ ...base(dir, { latencyMs: 0 }), model: undefined, modelFactory: (clock) => (model = new LoggedModel(logged, clock)) });
+    const fills = r.fills.map((f) => f.fill.side);
+    expect(fills[0]).toBe("buy");
+    expect(fills).toContain("sell");
+    expect(model!.hits).toBeGreaterThan(50);
+    expect(r.options.model).toBe("replay");
   });
 
   test("cycles are skipped while the data is stale", async () => {

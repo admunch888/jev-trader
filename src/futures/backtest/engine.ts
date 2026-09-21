@@ -17,7 +17,9 @@ export interface BacktestOptions {
   from?: string;
   to?: string;
   cfg: FuturesConfig;
-  model: Model<FuturesTradeState>;
+  model?: Model<FuturesTradeState>;
+  /** Alternative to `model` for models that need the replay clock (e.g. `LoggedModel`). */
+  modelFactory?: (clock: () => number) => Model<FuturesTradeState>;
   /** Decision to exchange: model call + network + exchange. Orders and cancels are matched against the book this long after they are sent. */
   latencyMs: number;
   /** Cap marketable fills at the size shown at the touch. */
@@ -33,7 +35,7 @@ export interface BacktestOptions {
 export interface BacktestFill { root: Root; fill: ExecFill; position: number }
 
 export interface BacktestResult {
-  options: Omit<BacktestOptions, "model" | "onDay" | "log" | "cfg"> & { model: string; cfg: Record<string, unknown> };
+  options: Omit<BacktestOptions, "model" | "modelFactory" | "onDay" | "log" | "cfg"> & { model: string; cfg: Record<string, unknown> };
   files: DayFile[];
   records: number;
   /** Every cycle event from every root, in time order. */
@@ -69,6 +71,8 @@ export async function runBacktest(o: BacktestOptions): Promise<BacktestResult> {
   const pick = await contractPicker(files, (root, at) => SPECS[root].session.tradingDay(at))();
   const md = new ReplayMarketData(pick);
   let clock = 0;
+  const model = o.modelFactory?.(() => clock) ?? o.model;
+  if (!model) throw new Error("runBacktest needs a model or a modelFactory");
   const ex = new SimExecution(md, { now: () => clock, defer: queueMicrotask, latencyMs: o.latencyMs, respectSize: o.respectSize });
   const guard = new RiskGuard(o.cfg.dailyLossUsd);
   const events: FuturesEvent[] = [];
@@ -79,7 +83,7 @@ export async function runBacktest(o: BacktestOptions): Promise<BacktestResult> {
   for (const r of o.roots) if (!roots.includes(r)) log(`no data for ${r}; skipping it`);
 
   const traders = roots.map((root) => new FuturesTrader({
-    root, md, ex, model: o.model, guard, cfg: o.cfg, liveOrders: false,
+    root, md, ex, model, guard, cfg: o.cfg, liveOrders: false,
     now: () => new Date(clock),
     onEvent: (e) => events.push(e),
     onFill: (fill, p) => fills.push({ root, fill, position: p.qty }),
@@ -151,7 +155,7 @@ export async function runBacktest(o: BacktestOptions): Promise<BacktestResult> {
   if (!started) throw new Error(`the data ends inside the ${o.warmupMinutes} minute warmup`);
   for (const t of traders) { t.mark("end of data"); t.stop(); }
 
-  const { model, onDay, log: _log, cfg, ...rest } = o;
+  const { model: _m, modelFactory: _f, onDay, log: _log, cfg, ...rest } = o;
   return {
     options: { ...rest, model: model.name, cfg: { ...cfg, stopTicks: Object.fromEntries(roots.map((r) => [r, cfg.stopTicks(r)])) } },
     files, records, events, fills, skipped, marks, startTs, endTs: clock, wallMs: Math.round(performance.now() - t0),

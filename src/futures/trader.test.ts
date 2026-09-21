@@ -25,7 +25,7 @@ class ScriptedModel implements Model<FuturesTradeState> {
 const TUE_0900_CDT = new Date("2026-09-22T14:00:00Z");
 const baseCfg: FuturesConfig = {
   ...futuresConfig, roots: ["MES"], exec: "sim", decisionSeconds: 30, horizonMinutes: 5, modelTimeoutMs: 50,
-  qty: 1, maxContracts: 1, enterProb: 0.6, flatBand: 0.05, slipTicks: 0, maxSpreadTicks: 2, stopTicks: () => 16,
+  qty: 1, maxContracts: 1, enterProb: 0.6, flatBand: 0.05, smoothN: 1, minHoldMinutes: 0, allowFlip: true, slipTicks: 0, maxSpreadTicks: 2, stopTicks: () => 16,
   dailyLossUsd: 1_000, entryCutoffMinutes: 10, flattenBeforeWeekendMinutes: 15, reconcileEveryCycles: 1_000, orderTimeoutMs: 30_000, depthRows: 0,
 };
 
@@ -159,6 +159,33 @@ describe("FuturesTrader", () => {
     await mnq.start();
     await mnq.cycle();
     expect(events.at(-1)!.notes).toEqual(["no quote: no real-time CME data (354)"]);
+  });
+
+  test("default anti-churn policy: confirm, hold, then flat before reversing", async () => {
+    const decisions: unknown[] = [];
+    const t = new FuturesTrader({ root: "MES", md, ex, model, guard: new RiskGuard(1_000), cfg: { ...baseCfg, smoothN: 2, minHoldMinutes: 5, allowFlip: false }, liveOrders: false, now: () => clock, onEvent: (e) => events.push(e), onDecision: (d) => decisions.push(d), log: () => {} });
+    await t.start();
+    const at = async (p: number, minutes: number) => { clock = new Date(TUE_0900_CDT.getTime() + minutes * 60_000); model.p = p; await t.cycle(); await Bun.sleep(5); await Bun.sleep(5); return events.at(-1)!; };
+
+    expect((await at(0.9, 0)).gate).toBe("confirm"); // one reading is not enough
+    const entry = await at(0.9, 0.5); // average 0.9: go long
+    expect(entry.order).toMatchObject({ side: "buy", qty: 1 });
+    expect(entry.decision!.upUsed).toBe(0.9);
+
+    const early = await at(0.1, 1); // average 0.5 inside the flat band, but the position is 30 s old
+    expect(early.gate).toBe("min-hold");
+    expect(early.order).toBeNull();
+
+    const reverse = await at(0.1, 6); // average 0.1: wants short, held 5.5 min; no flip, so flat first
+    expect(reverse.gate).toBe("no-flip");
+    expect(reverse.order).toMatchObject({ side: "sell", qty: 1 });
+    const short = await at(0.1, 6.5);
+    expect(short.order).toMatchObject({ side: "sell", qty: 1 }); // now the short, as its own entry
+    expect(t.position.qty).toBe(-1);
+
+    expect(decisions).toHaveLength(5); // every model call recorded, with its input
+    expect(decisions[0]).toMatchObject({ root: "MES", contract: "MESZ6", model: "mock", probabilities: { buy: 0.9 } });
+    expect((decisions[0] as { state: { contract: string } }).state.contract).toBe("MESZ6");
   });
 
   test("model timeout holds the position", async () => {

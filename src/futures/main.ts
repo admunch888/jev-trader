@@ -42,6 +42,7 @@ for (const root of cfg.roots) {
     root, md, ex, model, guard, cfg,
     liveOrders: cfg.exec === "ibkr",
     onEvent: (e) => { server.broadcastCycle(e); appendFileSync("data/futures-events.jsonl", JSON.stringify(e) + "\n"); logCycle(e); },
+    onDecision: (r) => appendFileSync("data/futures-decisions.jsonl", JSON.stringify(r) + "\n"),
     onFill: (f, p) => {
       server.broadcastFill(f);
       const spec = SPECS[p.root];
@@ -56,6 +57,7 @@ for (const root of cfg.roots) {
 
 const mode = cfg.exec === "sim" ? "SIM (no orders sent)" : isPaperPort(ibConfig.port) ? "IBKR PAPER" : "IBKR LIVE";
 console.log(`futures · ${mode} · model=${model.name} · roots ${cfg.roots.join(",")} · every ${cfg.decisionSeconds}s · horizon ${cfg.horizonMinutes}m · qty ${cfg.qty} max ${cfg.maxContracts} · daily loss $${cfg.dailyLossUsd} · :${cfg.port}`);
+console.log(`policy · enter ${cfg.enterProb} · flat band ${cfg.flatBand} · average of ${cfg.smoothN} · min hold ${cfg.minHoldMinutes}m · flips ${cfg.allowFlip ? "allowed" : "go flat first"} · decisions logged to data/futures-decisions.jsonl`);
 
 // Startup data check: say plainly what is flowing per root, and what the bot does if it is not.
 setTimeout(() => {
@@ -97,7 +99,8 @@ function logCycle(e: FuturesEvent) {
   const spec = SPECS[e.root];
   const px = (x: number | null) => (x === null ? "-" : formatPrice(spec, x));
   const d = e.decision;
-  const call = !d ? "no call" : d.late ? "LATE" : `up ${(d.probabilities.buy * 100).toFixed(0)}% ${d.latencyMs}ms`;
+  const avg = d?.upUsed != null && cfg.smoothN > 1 ? ` avg ${(d.upUsed * 100).toFixed(0)}%` : "";
+  const call = !d ? "no call" : d.late ? "LATE" : `up ${(d.probabilities.buy * 100).toFixed(0)}%${avg} ${d.latencyMs}ms`;
   const order = e.order ? ` -> ${e.order.side.toUpperCase()} ${e.order.qty} @ ${px(e.order.price)}` : "";
   const gate = e.gate ? ` [${e.gate}${e.gateDetail ? `: ${e.gateDetail}` : ""}]` : "";
   const stop = e.stop ? ` stop ${px(e.stop.price)}` : "";

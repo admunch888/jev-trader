@@ -16,6 +16,31 @@ export function targetFromProbability(pUp: number, current: number, p: PolicyPar
   return current;
 }
 
+/** Policy shaping between the model and the risk gates, to stop acting on noise. */
+export type Shape = "confirm" | "no-flip" | "min-hold";
+
+/** Average of the last `n` readings, or null until there are `n` of them. */
+export function smoothed(readings: number[], n: number): number | null {
+  if (readings.length < n) return null;
+  const last = readings.slice(-n);
+  return last.reduce((a, b) => a + b, 0) / n;
+}
+
+/**
+ * Shape the model's target before the risk gates:
+ *   no-flip   a target on the other side becomes flat (unless flips are allowed)
+ *   min-hold  a position younger than `minHoldMs` is not shrunk or reversed by the model
+ * Adding to a position is never blocked here (max contracts and the risk gates handle size).
+ */
+export function shapeTarget(wanted: number, current: number, o: { allowFlip: boolean; heldMs: number | null; minHoldMs: number }): { target: number; shape: Shape | null } {
+  let target = wanted;
+  let shape: Shape | null = null;
+  if (!o.allowFlip && current !== 0 && target !== 0 && Math.sign(target) !== Math.sign(current)) { target = 0; shape = "no-flip"; }
+  const shrinks = current !== 0 && (Math.sign(target) !== Math.sign(current) || Math.abs(target) < Math.abs(current));
+  if (shrinks && o.heldMs !== null && o.heldMs < o.minHoldMs) return { target: current, shape: "min-hold" };
+  return { target, shape };
+}
+
 /** Why the target was changed from what the model asked for. Order of precedence is the order checked. */
 export type Gate =
   | "broker" // order connection down: nothing can be sent, hold

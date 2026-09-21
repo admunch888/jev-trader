@@ -23,6 +23,15 @@ export const futuresConfig = {
   enterProb: num("FUT_ENTER_PROB", 0.6),
   /** Go flat when |P(up) - 0.5| <= flatBand. Between the band and `enter`, keep the current position. */
   flatBand: num("FUT_FLAT_BAND", 0.05),
+  /**
+   * Act on the average of the model's last N up-probabilities, not a single reading. No position is opened or
+   * changed until N consecutive readings exist (a cycle without an answer starts the count again). 1 = act on each.
+   */
+  smoothN: num("FUT_SMOOTH_N", 2),
+  /** Once in a position, the model cannot shrink or reverse it for this many minutes (risk gates and the stop still can). 0 = off. Defaults to the horizon. */
+  minHoldMinutes: num("FUT_MIN_HOLD_MIN", num("FUT_HORIZON_MIN", 5)),
+  /** false: a signal against the position goes flat first; the other side needs its own signal on a later cycle. */
+  allowFlip: env("FUT_ALLOW_FLIP", "false") === "true",
   /** Entries and exits are IOC limits at the touch plus this many ticks. */
   slipTicks: num("FUT_SLIP_TICKS", 0),
   /** No new risk when the spread is wider than this. */
