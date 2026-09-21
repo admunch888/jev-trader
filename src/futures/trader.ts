@@ -592,10 +592,16 @@ export class FuturesTrader {
   private buildStateV2(now: Date, book: BookSnapshot, gates: Gates): FuturesTradeStateV2 {
     const spec = this.spec, cfg = this.d.cfg, t = now.getTime();
     const ticks = (px: number) => px / spec.tickSize;
-    // One mid per minute, oldest first, ending now.
+    // One mid per minute the market was open, oldest first, ending now. Minutes in the daily break (or a weekend) are
+    // skipped: counting them as flat minutes would shrink the typical move and make every move after the open look like a burst.
     const minutes = (n: number) => {
       const out: number[] = [];
-      for (let k = n; k >= 1; k--) { const m = this.midAt(t - k * 60_000); if (m !== null) out.push(m); }
+      for (let k = n; k >= 1; k--) {
+        const ts = t - k * 60_000;
+        if (!spec.session.isOpen(new Date(ts))) continue;
+        const m = this.midAt(ts);
+        if (m !== null) out.push(m);
+      }
       out.push(book.mid);
       return out;
     };

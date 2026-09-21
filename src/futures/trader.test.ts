@@ -211,6 +211,26 @@ describe("FuturesTrader", () => {
     expect(s.position.heldMinutes).toBeNull();
   });
 
+  test("v2 input after the daily reopen ignores the break", async () => {
+    // Tue 17:10 Chicago, 10 minutes after the reopen. Bars: +-1 tick every minute until the 16:00 close, nothing in the break.
+    const reopen = new Date("2026-09-22T22:00:00Z").getTime(); // 17:00 CDT
+    clock = new Date(reopen + 10 * 60_000);
+    const bars = [];
+    for (let m = -130; m < 10; m++) {
+      const ts = reopen + m * 60_000;
+      if (ts >= reopen - 60 * 60_000 && ts < reopen) continue; // 16:00-17:00 break: no bars
+      bars.push({ ts, open: 0, high: 0, low: 0, close: 5700 + (Math.abs(m) % 2) * 0.25, volume: 0 });
+    }
+    const v2 = new FuturesTrader({ root: "MES", md, ex, model, guard: new RiskGuard(1_000), cfg: { ...baseCfg, stateVersion: "v2" }, liveOrders: false, now: () => clock, onEvent: (e) => events.push(e), log: () => {} });
+    md.seedBars(c, bars);
+    await v2.start();
+    md.setQuote(c, 5700, 5700.25);
+    await v2.cycle();
+    const s = model.last as import("./model").FuturesTradeStateV2;
+    expect(s.typicalMoveTicks.m1).toBeGreaterThan(0.9); // counting the break as flat minutes would give about 0.7
+    expect(s.cashSession).toBe(false);
+  });
+
   test("model timeout holds the position", async () => {
     model.hang = true;
     const e = await cycleAt(0.9);
