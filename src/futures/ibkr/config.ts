@@ -16,6 +16,10 @@ export const ibConfig = {
   /** Execution refuses to connect to a live port unless this is "true". */
   allowLive: env("IB_LIVE") === "true",
   reconnectMs: 5_000,
+  /** Longest wait between execution reconnect attempts; the wait doubles from `reconnectMs` up to this. */
+  maxReconnectMs: Number(env("IB_RECONNECT_MAX_S", "60")) * 1000,
+  /** Seconds between resubscribe attempts for a market data stream that failed (no subscription, no permissions). */
+  dataRetrySeconds: Number(env("IB_DATA_RETRY_S", "120")),
   requestTimeoutMs: 10_000,
 };
 

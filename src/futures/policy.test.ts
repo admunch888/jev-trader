@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { clampTarget, RiskGuard, targetFromProbability, type Gates } from "./policy";
 
 const P = { enterProb: 0.6, flatBand: 0.05, qty: 1 };
-const open: Gates = { halted: false, roll: false, weekend: false, stopBreached: false, closed: false, noNewRisk: [], maxContracts: 2 };
+const open: Gates = { brokerDown: false, halted: false, roll: false, weekend: false, stopBreached: false, closed: false, noNewRisk: [], maxContracts: 2 };
 
 describe("targetFromProbability", () => {
   test("long, short, flat, keep", () => {
@@ -19,6 +19,10 @@ describe("clampTarget", () => {
     for (const g of ["halted", "roll", "weekend", "stopBreached"] as const) {
       expect(clampTarget(1, 1, { ...open, [g]: true }).target).toBe(0);
     }
+  });
+
+  test("broker down holds whatever the other gates say", () => {
+    expect(clampTarget(0, 1, { ...open, brokerDown: true, halted: true })).toEqual({ target: 1, gate: "broker" });
   });
 
   test("closed session leaves the position alone", () => {

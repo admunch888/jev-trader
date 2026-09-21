@@ -143,6 +143,24 @@ describe("FuturesTrader", () => {
     expect(e.order).toMatchObject({ side: "sell", qty: 1 });
   });
 
+  test("holds while the broker connection is down, then trades when it is back", async () => {
+    Object.defineProperty(ex, "status", { value: "reconnecting", configurable: true });
+    const down = await cycleAt(0.9);
+    expect(down.gate).toBe("broker");
+    expect(down.decision).toBeNull(); // no model call it could not act on
+    expect(down.order).toBeNull();
+    Object.defineProperty(ex, "status", { value: "connected", configurable: true });
+    expect((await cycleAt(0.9)).order).toMatchObject({ side: "buy", qty: 1 });
+  });
+
+  test("a cycle without a quote says why", async () => {
+    Object.assign(md, { health: () => ({ quotes: "none", prints: "none", reason: "no real-time CME data (354)" }) });
+    const mnq = new FuturesTrader({ root: "MNQ", md, ex, model, guard: new RiskGuard(1_000), cfg: baseCfg, liveOrders: false, now: () => clock, onEvent: (e) => events.push(e), log: () => {} });
+    await mnq.start();
+    await mnq.cycle();
+    expect(events.at(-1)!.notes).toEqual(["no quote: no real-time CME data (354)"]);
+  });
+
   test("model timeout holds the position", async () => {
     model.hang = true;
     const e = await cycleAt(0.9);

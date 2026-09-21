@@ -178,14 +178,17 @@ export class FuturesTrader {
     if (now >= this.contract.calendar.rollDate && this.pos.qty === 0 && !this.orders.size) await this.rollOver(now, notes);
 
     const book = this.d.md.book(this.contract);
-    if (!book) return this.emit({ book: null, notes: [...notes, "no quote"] });
+    if (!book) {
+      const why = this.d.md.health?.(this.contract).reason;
+      return this.emit({ book: null, notes: [...notes, why ? `no quote: ${why}` : "no quote"] });
+    }
     this.recordMid(now.getTime(), book.mid);
     this.markDay(now, book);
 
     if (this.needReconcile || this.cycleNo % this.d.cfg.reconcileEveryCycles === 0) await this.reconcile("periodic", notes);
 
     const gates = this.gates(now, book);
-    const forced = gates.halted || gates.roll || gates.weekend || gates.stopBreached || gates.closed;
+    const forced = gates.brokerDown || gates.halted || gates.roll || gates.weekend || gates.stopBreached || gates.closed;
     let decision: FuturesEvent["decision"] = null;
     let wanted: number | null = null;
     if (!forced) {
@@ -214,7 +217,9 @@ export class FuturesTrader {
     if (book.spreadTicks > cfg.maxSpreadTicks) noNewRisk.push(`spread ${book.spreadTicks} ticks`);
     if (book.delayed && this.d.liveOrders) noNewRisk.push("delayed data");
     if (this.d.md.status !== "connected") noNewRisk.push(`feed ${this.d.md.status}`);
+    const exec = this.d.ex.status;
     return {
+      brokerDown: !!exec && exec !== "connected",
       halted: !!this.d.guard.halted,
       roll: now >= this.contract.calendar.rollDate,
       weekend: !!close?.weekend && close.minutes <= cfg.flattenBeforeWeekendMinutes,
@@ -270,6 +275,7 @@ export class FuturesTrader {
   /** Keep exactly one GTC stop covering the whole position at `stopTicks` from the average entry. Idempotent. */
   private async maintainStop(book: BookSnapshot | null) {
     if (this.stopBusy || this.hasUnsettledEntry()) return;
+    if (this.d.ex.status && this.d.ex.status !== "connected") return; // the stop already at IBKR keeps working
     this.stopBusy = true;
     try {
       const stop = this.workingStop();

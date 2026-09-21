@@ -61,6 +61,8 @@ Calendars skip weekends but not exchange holidays; `IbkrMarketData.resolve` repl
 
 `IbkrExecution` refuses the live ports (4001, 7496) unless `IB_LIVE=true`.
 
+**When data or the connection goes missing.** A few seconds after `bun run futures` starts, it prints a data check per product (`live quotes, trades on`, or what is missing and why). Quotes, trades and depth recover independently: a missing subscription, missing permissions or a competing live session is explained once in the log with the fix, the book is cleared so nothing trades on a stale quote (cycles show `no quote: <reason>`), and the stream is retried every `IB_DATA_RETRY_S` (120 s), so fixing the account needs no restart. If the order connection drops (the Gateway's daily restart), orders are refused and the loop holds under the `broker` gate while it reconnects (5 s doubling to `IB_RECONNECT_MAX_S`); it then re-requests open orders and today's executions so anything that filled meanwhile is applied once. Protective stops live at IBKR and keep working throughout. If the Gateway loses IBKR's servers (1100) orders pause until IBKR reports the link restored.
+
 ## The loop
 
 Every `FUT_DECISION_S` seconds, per root (roots are staggered across the interval):
@@ -77,6 +79,7 @@ Every `FUT_DECISION_S` seconds, per root (roots are staggered across the interva
 | past the roll date | flatten, then roll |
 | within `FUT_FLATTEN_WEEKEND_MIN` of the Friday close | flatten |
 | price through the stop level with no stop working | flatten |
+| order connection down (Gateway restarting) | hold: no model call, no orders |
 | session closed | do nothing |
 | within `FUT_ENTRY_CUTOFF_MIN` of the daily close, spread over `FUT_MAX_SPREAD_TICKS`, delayed data with real orders, feed down | exits only |
 | `FUT_MAX_CONTRACTS` | cap |
@@ -88,7 +91,7 @@ Position and PnL come from fills (with real commissions on IBKR). An order count
 
 ## Running
 
-    bun run test:futures                        # 42 tests, no broker needed
+    bun run test:futures                        # 53 tests, no broker needed
     FUT_ROOTS=MES,MNQ,ZB bun run futures        # sim: real quotes, simulated fills
     FUT_EXEC=ibkr bun run futures               # orders to the IBKR paper account on IB_PORT
     MODEL=jev TYPESAFE_AI_API_KEY=... bun run futures   # Jev instead of the mock

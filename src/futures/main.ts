@@ -57,6 +57,20 @@ for (const root of cfg.roots) {
 const mode = cfg.exec === "sim" ? "SIM (no orders sent)" : isPaperPort(ibConfig.port) ? "IBKR PAPER" : "IBKR LIVE";
 console.log(`futures · ${mode} · model=${model.name} · roots ${cfg.roots.join(",")} · every ${cfg.decisionSeconds}s · horizon ${cfg.horizonMinutes}m · qty ${cfg.qty} max ${cfg.maxContracts} · daily loss $${cfg.dailyLossUsd} · :${cfg.port}`);
 
+// Startup data check: say plainly what is flowing per root, and what the bot does if it is not.
+setTimeout(() => {
+  for (const t of traders) {
+    const h = md.health(t.contract);
+    const quotes = h.quotes === "live" ? "live quotes" : h.quotes === "delayed" ? "DELAYED quotes (15 min)" : "NO quotes";
+    const prints = h.prints === "live" ? "trades on" : "no trades";
+    let then = "";
+    if (h.quotes === "none") then = `: it will not trade ${t.contract.code} and retries every ${ibConfig.dataRetrySeconds}s${h.reason ? ` (${h.reason}; fix in the ibkr md message above)` : ""}`;
+    else if (h.quotes === "delayed") then = cfg.exec === "ibkr" ? ": delayed data never opens positions with real orders" : ": fine for checking the plumbing, not for judging the strategy";
+    else if (h.prints === "none") then = `: trade flow inputs empty${h.reason ? ` (${h.reason})` : ""}`;
+    console.log(`[${t.contract.root}] data check: ${quotes}, ${prints}${then}`);
+  }
+}, 5_000);
+
 // Stagger the roots across the interval so model calls and orders do not bunch up.
 const timers: ReturnType<typeof setInterval>[] = [];
 traders.forEach((t, i) => {

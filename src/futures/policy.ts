@@ -18,6 +18,7 @@ export function targetFromProbability(pUp: number, current: number, p: PolicyPar
 
 /** Why the target was changed from what the model asked for. Order of precedence is the order checked. */
 export type Gate =
+  | "broker" // order connection down: nothing can be sent, hold
   | "halted" // daily loss limit, flatten
   | "roll" // contract past its roll date, flatten
   | "weekend" // close to the weekend close, flatten
@@ -27,6 +28,7 @@ export type Gate =
   | "max-contracts";
 
 export interface Gates {
+  brokerDown: boolean;
   halted: boolean;
   roll: boolean;
   weekend: boolean;
@@ -38,6 +40,7 @@ export interface Gates {
 }
 
 export function clampTarget(target: number, current: number, g: Gates): { target: number; gate: Gate | null; detail?: string } {
+  if (g.brokerDown) return { target: current, gate: "broker" };
   if (g.halted) return { target: 0, gate: "halted" };
   if (g.roll) return { target: 0, gate: "roll" };
   if (g.weekend) return { target: 0, gate: "weekend" };

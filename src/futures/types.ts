@@ -124,6 +124,13 @@ export interface Bar {
 }
 
 export type BarSize = "5s" | "1m" | "5m";
+
+/** What data is flowing for a contract, and if something is missing, a short reason. */
+export interface DataHealth {
+  quotes: "live" | "delayed" | "none";
+  prints: "live" | "none";
+  reason: string | null;
+}
 export type FeedStatus = "connecting" | "connected" | "disconnected";
 
 export interface MarketData {
@@ -141,6 +148,8 @@ export interface MarketData {
   onPrint(contract: FuturesContract, cb: (p: Print) => void): () => void;
   /** Historical bars ending now, including the overnight session. `lookback` in IBKR duration form, e.g. "1 D", "3600 S". */
   bars(contract: FuturesContract, size: BarSize, lookback: string): Promise<Bar[]>;
+  /** Optional: data health per contract, for status lines and startup checks. */
+  health?(contract: FuturesContract): DataHealth;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -213,7 +222,11 @@ export interface WhatIf {
   commission: number | null;
 }
 
+export type ExecStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
+
 export interface Execution {
+  /** Optional: connection state, for brokers that can drop and come back. Absent means always connected (simulation). */
+  readonly status?: ExecStatus;
   connect(): Promise<void>;
   close(): Promise<void>;
   /** Send an order. Resolves with the broker id once it is transmitted, not once it is working; watch `onOrder`. */
