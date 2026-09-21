@@ -1,0 +1,53 @@
+import { describe, expect, test } from "bun:test";
+import { clampTarget, RiskGuard, targetFromProbability, type Gates } from "./policy";
+
+const P = { enterProb: 0.6, flatBand: 0.05, qty: 1 };
+const open: Gates = { halted: false, roll: false, weekend: false, stopBreached: false, closed: false, noNewRisk: [], maxContracts: 2 };
+
+describe("targetFromProbability", () => {
+  test("long, short, flat, keep", () => {
+    expect(targetFromProbability(0.7, 0, P)).toBe(1);
+    expect(targetFromProbability(0.3, 1, P)).toBe(-1);
+    expect(targetFromProbability(0.52, 1, P)).toBe(0);
+    expect(targetFromProbability(0.57, -1, P)).toBe(-1); // between band and enter: keep
+    expect(targetFromProbability(0.43, 1, P)).toBe(1);
+  });
+});
+
+describe("clampTarget", () => {
+  test("flatten gates win over the model", () => {
+    for (const g of ["halted", "roll", "weekend", "stopBreached"] as const) {
+      expect(clampTarget(1, 1, { ...open, [g]: true }).target).toBe(0);
+    }
+  });
+
+  test("closed session leaves the position alone", () => {
+    expect(clampTarget(-1, 1, { ...open, closed: true })).toEqual({ target: 1, gate: "closed" });
+  });
+
+  test("no new risk: exits allowed, adds and flips cut back", () => {
+    const g = { ...open, noNewRisk: ["spread 3 ticks"] };
+    expect(clampTarget(1, 0, g).target).toBe(0); // open
+    expect(clampTarget(-1, 1, g).target).toBe(0); // flip becomes exit
+    expect(clampTarget(2, 1, g).target).toBe(1); // add refused
+    expect(clampTarget(0, 1, g)).toEqual({ target: 0, gate: null }); // plain exit is not gated
+  });
+
+  test("max contracts", () => {
+    expect(clampTarget(-3, 0, open)).toEqual({ target: -2, gate: "max-contracts" });
+  });
+});
+
+describe("RiskGuard", () => {
+  test("halts on the summed daily loss and resets on a new trading day", () => {
+    const g = new RiskGuard(100);
+    g.report("MES", "2026-09-22", -60);
+    expect(g.halted).toBeNull();
+    g.report("ZB", "2026-09-22", -45);
+    expect(g.halted).toContain("$105.00");
+    g.report("MES", "2026-09-22", 0); // recovering does not un-halt
+    expect(g.halted).not.toBeNull();
+    g.report("MES", "2026-09-23", 0);
+    expect(g.halted).toBeNull();
+  });
+});

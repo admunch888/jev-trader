@@ -34,12 +34,22 @@ export interface Decision {
   inputTokens: number;
 }
 
-export interface Model {
+/** Generic over the state it reads, so the futures loop can reuse the same models with its own state. */
+export interface Model<S = TradeState> {
   readonly name: string;
-  decide(state: TradeState): Promise<Decision>;
+  decide(state: S): Promise<Decision>;
 }
 
-const QUESTIONS = {
+/** One two-way choice, `direction`: buy or sell. The instructions are what differ between markets. */
+export type DirectionQuestions = {
+  readonly direction: {
+    readonly type: "choice";
+    readonly instructions: Readonly<Record<string, string>>;
+    readonly criteria: { readonly buy: string; readonly sell: string };
+  };
+};
+
+const QUESTIONS: DirectionQuestions = {
   direction: {
     type: "choice",
     instructions: {
@@ -53,16 +63,18 @@ const QUESTIONS = {
       sell: "Sell MON now: mid more likely to be lower after `horizonBlocks` blocks, by more than the spread.",
     },
   },
-} as const;
+};
 
 /** Real Jev via the AI SDK. Swap-in is the MODEL env var. */
-export class JevModel implements Model {
+export class JevModel<S = TradeState> implements Model<S> {
   readonly name = config.jevModelId;
   private model = typeSafeAi.evaluationModel(config.jevModelId);
 
-  async decide(state: TradeState): Promise<Decision> {
+  constructor(private questions: DirectionQuestions = QUESTIONS) {}
+
+  async decide(state: S): Promise<Decision> {
     const t0 = performance.now();
-    const r = await experimental_evaluate({ model: this.model, state: state as any, questions: QUESTIONS, maxRetries: 0 });
+    const r = await experimental_evaluate({ model: this.model, state: state as any, questions: this.questions, maxRetries: 0 });
     const a = r.answers.direction;
     const p = a.probabilities ?? { buy: 0, sell: 0, [a.choice]: 1 };
     const buy = p.buy ?? 0, sell = p.sell ?? 0;

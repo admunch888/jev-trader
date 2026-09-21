@@ -21,6 +21,19 @@ const GLOBEX: SessionHours = {
     if (weekday === 5) return minutes < close; // Friday close
     return minutes < close || minutes >= open; // daily maintenance break
   },
+  nextClose(at) {
+    if (!this.isOpen(at)) return null;
+    const { weekday, minutes } = chicago(at);
+    const close = 16 * 60;
+    const evening = minutes >= 17 * 60; // this session closes tomorrow at 16:00
+    return {
+      minutes: evening ? 24 * 60 - minutes + close : close - minutes,
+      weekend: weekday === 5 || (weekday === 4 && evening),
+    };
+  },
+  tradingDay(at) {
+    return chicagoDate(new Date(at.getTime() + 7 * 3_600_000)); // 17:00 Chicago + 7h = midnight of the next trading day
+  },
 };
 
 /** Equity index futures: last trade on the third Friday of the contract month; the market rolls 8 days earlier (the Thursday of the week before). */
@@ -160,6 +173,9 @@ export function lastBusinessDay(year: number, month: number): Date {
 
 const CHICAGO = new Intl.DateTimeFormat("en-US", { timeZone: "America/Chicago", weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+const CHICAGO_DATE = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Chicago", year: "numeric", month: "2-digit", day: "2-digit" });
+const chicagoDate = (at: Date) => CHICAGO_DATE.format(at);
 
 function chicago(at: Date): { weekday: number; minutes: number } {
   const parts = Object.fromEntries(CHICAGO.formatToParts(at).map((p) => [p.type, p.value]));

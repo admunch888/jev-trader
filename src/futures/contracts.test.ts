@@ -53,6 +53,18 @@ describe("session", () => {
     expect(open("2026-12-01T22:30:00Z")).toBe(false); // Tue 16:30 CST break (winter offset)
     expect(open("2026-12-01T23:00:00Z")).toBe(true); // Tue 17:00 CST reopen
   });
+
+  test("next close and trading day", () => {
+    const s = SPECS.ZB.session;
+    expect(s.nextClose(new Date("2026-09-22T20:30:00Z"))).toEqual({ minutes: 30, weekend: false }); // Tue 15:30 CDT
+    expect(s.nextClose(new Date("2026-09-22T22:00:00Z"))).toEqual({ minutes: 23 * 60, weekend: false }); // Tue 17:00 CDT
+    expect(s.nextClose(new Date("2026-09-24T22:00:00Z"))).toEqual({ minutes: 23 * 60, weekend: true }); // Thu 17:00 CDT, closes Fri
+    expect(s.nextClose(new Date("2026-09-25T20:50:00Z"))).toEqual({ minutes: 10, weekend: true }); // Fri 15:50 CDT
+    expect(s.nextClose(new Date("2026-09-22T21:30:00Z"))).toBeNull(); // in the break
+    expect(s.tradingDay(new Date("2026-09-20T22:30:00Z"))).toBe("2026-09-21"); // Sun 17:30 CDT belongs to Monday
+    expect(s.tradingDay(new Date("2026-09-21T20:00:00Z"))).toBe("2026-09-21"); // Mon 15:00 CDT
+    expect(s.tradingDay(new Date("2026-09-21T22:30:00Z"))).toBe("2026-09-22"); // Mon 17:30 CDT belongs to Tuesday
+  });
 });
 
 describe("tick math", () => {

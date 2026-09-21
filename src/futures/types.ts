@@ -58,6 +58,10 @@ export interface SessionHours {
   tz: string;
   /** Whether the product is in its electronic trading session at `at` (holidays and early closes not modelled). */
   isOpen(at: Date): boolean;
+  /** Minutes until the session in progress at `at` closes, and whether that close starts the weekend. Null when closed. */
+  nextClose(at: Date): { minutes: number; weekend: boolean } | null;
+  /** The trading day `at` belongs to, as YYYY-MM-DD. A Globex day starts at the 17:00 Chicago open, so Sunday evening counts as Monday. */
+  tradingDay(at: Date): string;
 }
 
 /** One listed expiry: the thing you subscribe to and trade. */

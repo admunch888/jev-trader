@@ -1,13 +1,20 @@
-# Futures adapters (MES, MNQ, ZB on IBKR)
+# Futures trader (MES, MNQ, ZB on IBKR)
 
-A sketch of what the Monad/Kuru loop needs in order to trade listed futures through Interactive Brokers. It is not wired into `src/trader.ts` yet and places no orders on its own. The Monad bot is unchanged.
+A futures trader for Interactive Brokers, separate from the Monad bot: same `Model` (mock or Jev), its own state, policy, risk gates and loop. `bun run futures` starts it in simulation by default: real IBKR quotes, simulated fills, nothing sent. The Monad bot is unchanged apart from `Model` becoming generic over its state.
 
 ## Layout
 
+    main.ts             entry point (bun run futures): one trader per root, shared connections and loss guard
+    trader.ts           FuturesTrader: the decision loop, orders, protective stop, position and PnL, roll
+    policy.ts           probability -> target position, risk gates, account-wide daily loss guard (pure)
+    model.ts            FuturesTradeState, the Jev questions for futures, a mock stand-in
+    sim.ts              SimExecution (fills against any MarketData) and ManualMarketData (tests, replay)
+    server.ts           GET / , /history?root= , /events SSE on FUT_PORT
+    config.ts           FUT_* env
     types.ts            ContractSpec, MarketData, Execution and the shared types. Venue neutral.
     contracts.ts        MES, MNQ, ZB specs: tick, multiplier, cycle, expiry / first notice / roll calendar,
                         Globex session, tick math, 32nds formatting for ZB
-    contracts.test.ts   calendar, session and tick math tests (bun test src/futures)
+    *.test.ts           calendars, session, tick math, policy, and the loop end to end on the simulator
     ibkr/config.ts      IB_* env, paper vs live port guard
     ibkr/contract.ts    our FuturesContract <-> IBKR Contract
     ibkr/marketData.ts  IbkrMarketData: resolve front month (conId + real last trade date), top of book,
@@ -46,11 +53,45 @@ Calendars skip weekends but not exchange holidays; `IbkrMarketData.resolve` repl
 
 `IbkrExecution` refuses the live ports (4001, 7496) unless `IB_LIVE=true`.
 
-## Not built yet
+## The loop
 
-- **A futures trader loop.** `src/trader.ts` is block-driven and assumes spot inventory. A futures loop should run on a timer or on bar close, read `md.book()`, build a futures `TradeState`, call the same `Model`, check risk, then `ex.place`. Position and PnL come from `ExecFill` using `pnlUsd`, and are checked against `ex.positions()` on startup and after reconnects.
-- **A risk gate** in front of `place`: max contracts per root, max daily loss, no new positions outside `session.isOpen` or after `rollDate`, flatten ahead of ZB first notice, `whatIf` margin check before adding.
-- **A backtester** with queue-aware fills. Joining a one-tick-wide ES/NQ/ZB book puts the order at the back of a deep queue, so "filled when a print touches our price" (the Monad dry-run rule) overstates fills badly.
-- **Features for rates.** For ZB the MON-USDC book features are not enough on their own; add the economic calendar (CPI, NFP, FOMC, auctions) and yield/curve context.
+Every `FUT_DECISION_S` seconds, per root (roots are staggered across the interval):
 
-The Monad strategy (cancel and repost every 300 ms, one tick inside the touch) should not be ported as-is: there is no inside on a one-tick market, hosted-model latency loses to co-located makers, and constant cancel/replace draws CME messaging and disruptive-practice (Rule 575) scrutiny. Decide on a cadence of seconds to minutes and prefer resting orders that are left alone, or marketable orders with brackets.
+1. Bookkeeping: expire orders stuck without a final status, roll to the next contract once flat past the roll date, start a new trading day's PnL at the 17:00 Chicago open, reconcile with the broker every `FUT_RECONCILE_CYCLES` (adopting the broker's position if they disagree).
+2. Read the book from memory and work out the risk gates.
+3. Unless a gate already decides (halted, roll, weekend, stop breached, session closed), ask the model buy or sell for the next `FUT_HORIZON_MIN` minutes. No answer within `FUT_MODEL_TIMEOUT_MS` means hold.
+4. Target position from the probability of up: long at `FUT_ENTER_PROB` or above, short at `1 - FUT_ENTER_PROB` or below, flat within `FUT_FLAT_BAND` of 50/50, otherwise keep. Hysteresis keeps a wavering model from churning.
+5. Risk gates can only move the target toward flat:
+
+| Gate | Effect |
+|---|---|
+| daily loss (`FUT_DAILY_LOSS_USD`, summed over all roots) | flatten, no new risk until the next trading day |
+| past the roll date | flatten, then roll |
+| within `FUT_FLATTEN_WEEKEND_MIN` of the Friday close | flatten |
+| price through the stop level with no stop working | flatten |
+| session closed | do nothing |
+| within `FUT_ENTRY_CUTOFF_MIN` of the daily close, spread over `FUT_MAX_SPREAD_TICKS`, delayed data with real orders, feed down | exits only |
+| `FUT_MAX_CONTRACTS` | cap |
+
+6. If the target differs from the position and nothing is in flight: one IOC limit at the touch (plus `FUT_SLIP_TICKS`) for the difference. A flip is one order. Orders that reduce the position pull the stop first so both cannot fill.
+7. Keep exactly one GTC stop covering the whole position, `FUT_STOP_TICKS_<ROOT>` from the average entry. It lives at the broker, so it protects the position if this process dies.
+
+Position and PnL come from fills (with real commissions on IBKR). An order counts as settled only when its final status and all its fills have arrived, since IBKR sends them separately and in either order. Every cycle is written to `data/futures-events.jsonl` and streamed on `/events`.
+
+## Running
+
+    bun run test:futures                        # 30 tests, no broker needed
+    FUT_ROOTS=MES,MNQ,ZB bun run futures        # sim: real quotes, simulated fills
+    FUT_EXEC=ibkr bun run futures               # orders to the IBKR paper account on IB_PORT
+    MODEL=jev TYPESAFE_AI_API_KEY=... bun run futures   # Jev instead of the mock
+
+Before `FUT_EXEC=ibkr`: use a dedicated paper account (startup cancels every open order on it unless `FUT_CANCEL_ON_START=false`), and run sim for a while first. Real money needs `IB_LIVE=true` and a live port on top of `FUT_EXEC=ibkr`.
+
+## Known limits
+
+- **The simulator is optimistic.** `SimExecution` fills the whole order at the touch, ignores queue position and size, and fills a stop at the touch that triggered it. Treat sim PnL as an upper bound.
+- **No backtester yet.** `ManualMarketData` is the seam for replaying recorded quotes through the same loop; there is no historical data loader.
+- **A stop that has already triggered at the exchange cannot be cancelled.** If it fills at the same moment as an exit, the position overshoots; the next reconcile adopts the broker's position and the loop trades back to target.
+- **Holidays and early closes are not modelled** in session hours. Trading on a holiday session just finds no quote, or IBKR rejects the order.
+- **Features for rates.** For ZB the book and price-path features are thin; the economic calendar (CPI, NFP, FOMC, auctions) and yield/curve context are not in the state yet.
+- **The mock model is not a strategy.** Nothing here has been shown to make money. Jev's futures questions are a first draft.
