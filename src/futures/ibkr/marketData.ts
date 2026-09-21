@@ -1,4 +1,4 @@
-import { BarSizeSetting, ConnectionState, IBApiNext, IBApiTickType as Tick, WhatToShow, type MarketDataType, type OrderBookRows } from "@stoqey/ib";
+import { BarSizeSetting, ConnectionState, IBApiNext, IBApiTickType as Tick, WhatToShow, type HistoricalTickBidAsk, type HistoricalTickLast, type MarketDataType, type OrderBookRows } from "@stoqey/ib";
 import { frontContract, SPECS, toTicks } from "../contracts";
 import type { Bar, BarSize, BookLevel, BookSnapshot, FeedStatus, FuturesContract, MarketData, Print, Root } from "../types";
 import { ibConfig } from "./config";
@@ -140,6 +140,23 @@ export class IbkrMarketData implements MarketData {
       .map((b) => ({ ts: Number(b.time) * 1000, open: b.open!, high: b.high!, low: b.low!, close: b.close!, volume: b.volume ?? 0 }));
   }
 
+  /**
+   * Up to `count` (IBKR caps it at 1000) historical bid/ask changes from `startMs`, oldest first. IBKR stamps them
+   * to the whole second. Needs the same market data subscription as live quotes, and is paced by IBKR (roughly 60
+   * historical requests per 10 minutes), so callers should wait between pages.
+   */
+  historicalQuotes(contract: FuturesContract, startMs: number, count = 1000) {
+    return lastOf<HistoricalTickBidAsk[]>(this.api.getHistoricalTicksBidAsk(toIbContract(contract), ibUtc(startMs), undefined, count, false, false))
+      .then((ticks) => ticks.filter((t) => t.time && t.priceBid && t.priceAsk)
+        .map((t) => ({ t: t.time! * 1000, b: t.priceBid!, a: t.priceAsk!, bs: t.sizeBid ?? 0, as: t.sizeAsk ?? 0 })));
+  }
+
+  /** Up to `count` historical trades from `startMs`, oldest first, stamped to the whole second. Same pacing as quotes. */
+  historicalTrades(contract: FuturesContract, startMs: number, count = 1000) {
+    return lastOf<HistoricalTickLast[]>(this.api.getHistoricalTicksLast(toIbContract(contract), ibUtc(startMs), undefined, count, false))
+      .then((ticks) => ticks.filter((t) => t.time && t.price && t.size).map((t) => ({ t: t.time! * 1000, p: t.price!, s: t.size! })));
+  }
+
   private publish(s: Stream) {
     const b = snapshot(s);
     if (b) s.onBook.forEach((cb) => cb(b));
@@ -168,6 +185,22 @@ function snapshot(s: Stream): BookSnapshot | null {
     last: s.last,
     delayed: s.delayed,
   };
+}
+
+/** IBKR's UTC date-time form for historical requests: yyyymmdd-hh:mm:ss. */
+const ibUtc = (ms: number) => new Date(ms).toISOString().replace(/-/g, "").replace("T", "-").slice(0, 17);
+
+/** Last value an observable emits before it completes (IBKR historical requests emit the growing list). */
+function lastOf<T>(obs: { subscribe(o: { next: (v: T) => void; error: (e: unknown) => void; complete: () => void }): { unsubscribe(): void } }, timeoutMs = 60_000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let last: T | undefined;
+    const timer = setTimeout(() => { sub.unsubscribe(); reject(new Error(`historical request timed out after ${timeoutMs} ms`)); }, timeoutMs);
+    const sub = obs.subscribe({
+      next: (v) => { last = v; },
+      error: (e) => { clearTimeout(timer); reject(new Error((e as { error?: Error })?.error?.message ?? String(e))); },
+      complete: () => { clearTimeout(timer); resolve(last ?? ([] as T)); },
+    });
+  });
 }
 
 const rows = (r: OrderBookRows): BookLevel[] =>

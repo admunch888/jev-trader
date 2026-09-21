@@ -155,6 +155,13 @@ export class FuturesTrader {
     }
   }
 
+  /** Record the position marked at the current book without deciding anything (the end of a backtest). */
+  mark(note: string) {
+    const book = this.d.md.book(this.contract);
+    if (book) this.markDay(this.now(), book);
+    this.emit({ book, notes: [note] });
+  }
+
   /** Send an order to go flat now (shutdown). Stops stay working until the fill lands. */
   async flatten() {
     const book = this.d.md.book(this.contract);

@@ -21,6 +21,14 @@ A futures trader for Interactive Brokers, separate from the Monad bot: same `Mod
                         tick-by-tick prints, optional depth, historical bars. IBApiNext (auto-reconnect).
     ibkr/execution.ts   IbkrExecution: place / modify / cancel / cancelAll, brackets, whatIf margin,
                         positions, account summary, order and fill streams with commissions. IBApi.
+    backtest/format.ts  tick store: one JSONL file per contract per trading day, reader (gzip ok), writer, index
+    backtest/replay.ts  ReplayMarketData: recorded ticks in, book / prints / minute bars out; merges contracts by time
+    backtest/engine.ts  runBacktest: the live FuturesTrader on a replay clock, SimExecution as the exchange
+    backtest/report.ts  round trips, PnL breakdown, drawdown, daily Sharpe, buy and hold; summary/trades/equity files
+    backtest/cli.ts     bun run backtest
+    backtest/record.ts  bun run record: live IBKR quotes and prints into the tick store
+    backtest/fetch.ts   bun run fetch-ticks: IBKR historical ticks into the tick store
+    backtest/synth.ts   seeded random-walk ticks for trying it and for tests
     ../../scripts/ibkr-smoke.ts   read-only check against a running TWS / Gateway
 
 ## The three seams
@@ -80,17 +88,48 @@ Position and PnL come from fills (with real commissions on IBKR). An order count
 
 ## Running
 
-    bun run test:futures                        # 30 tests, no broker needed
+    bun run test:futures                        # 42 tests, no broker needed
     FUT_ROOTS=MES,MNQ,ZB bun run futures        # sim: real quotes, simulated fills
     FUT_EXEC=ibkr bun run futures               # orders to the IBKR paper account on IB_PORT
     MODEL=jev TYPESAFE_AI_API_KEY=... bun run futures   # Jev instead of the mock
 
 Before `FUT_EXEC=ibkr`: use a dedicated paper account (startup cancels every open order on it unless `FUT_CANCEL_ON_START=false`), and run sim for a while first. Real money needs `IB_LIVE=true` and a live port on top of `FUT_EXEC=ibkr`.
 
+## Backtesting
+
+The backtester replays recorded quotes through the **same** `FuturesTrader`, policy, risk gates and stop logic the live bot runs, with `SimExecution` as the exchange, on a virtual clock. Nothing in the loop knows it is a backtest.
+
+**1. Get ticks.** Either record them live, or download a window of history:
+
+    bun run record                                   # leave running; FUT_ROOTS, real-time data needed
+    bun run fetch-ticks --root MES --from 2026-09-22T13:30:00Z --to 2026-09-22T16:00:00Z
+
+Both write `data/ticks/<ROOT>/<CODE>/<trading day>.jsonl` (format in `backtest/format.ts`; `.jsonl.gz` also reads). The recorder is the better source: it captures exactly what the live bot sees, and records the next contract too from 10 days before a roll. `fetch-ticks` is limited by IBKR (1000 ticks a request, about 60 requests per 10 minutes, whole-second stamps), so it suits hours, not months. Data from any vendor can be converted to the same format.
+
+**2. Run.**
+
+    bun run backtest --roots MES,ZB --from 2026-09-22 --to 2026-09-26
+    bun run backtest --synthetic 5 --roots MES,MNQ,ZB     # no data needed: seeded random walk, not market data
+
+| Flag | Default | |
+|---|---|---|
+| `--latency` | 250 ms | Decision to exchange. Orders and cancels are matched against the book as it is when they arrive, so an IOC at a stale price misses. Set it to your measured model + network time. |
+| `--respect-size` | off | Cap marketable fills at the displayed touch size. |
+| `--warmup` | 60 min | Replay before the first decision so returns and bars have history. |
+| `--stale` | 120 s | Skip a cycle when the contract's last quote is older (data gaps, missing files). |
+| `--decision-s --horizon-min --enter --flat-band --qty --max-contracts --stop-ticks --daily-loss --max-spread --slip-ticks` | FUT_* | Strategy overrides. |
+| `--confirm-jev` | | Required with `MODEL=jev`: every cycle is a paid call (about 2,760 per root per trading day at 30 s). |
+
+**3. Read it.** The console prints net PnL (realized, open, fees), round trips, win rate, profit factor, expectancy, hold time, max drawdown, daily Sharpe (5+ days), gate counts and a buy and hold comparison per root. `data/backtests/<time>/` gets `summary.json`, `trades.csv` (one row per flat-to-flat round trip), `equity.csv` (after every cycle) and `cycles.jsonl` (every decision, as the live `/events` stream).
+
+How the clock works: records are replayed in time order across contracts. Before each record, everything due earlier runs in time order: decision cycles every `decisionSeconds` per root (staggered as live) and orders or cancels reaching the exchange after `latency`. Then the record updates the book, and resting stops trigger on it at that quote, so gaps slip. Status and fill messages are delivered as microtasks and flushed before the clock moves, in the same status-then-fill order as IBKR. Positions are marked at the last quote when the data ends.
+
+What it does not model: queue position (entries are IOCs at the touch, so this matters little; a strategy with resting limits would be optimistic), depth beyond the touch, exchange holidays, and model behavior under real latency (the model answers instantly in replay time; `--latency` stands in for its delay).
+
 ## Known limits
 
 - **The simulator is optimistic.** `SimExecution` fills the whole order at the touch, ignores queue position and size, and fills a stop at the touch that triggered it. Treat sim PnL as an upper bound.
-- **No backtester yet.** `ManualMarketData` is the seam for replaying recorded quotes through the same loop; there is no historical data loader.
+- **Backtests are only as good as the ticks.** IBKR's live top of book is sampled, and its historical ticks are stamped to the second. Replay results are a guide to how the loop behaves, not a forecast.
 - **A stop that has already triggered at the exchange cannot be cancelled.** If it fills at the same moment as an exit, the position overshoots; the next reconcile adopts the broker's position and the loop trades back to target.
 - **Holidays and early closes are not modelled** in session hours. Trading on a holiday session just finds no quote, or IBKR rejects the order.
 - **Features for rates.** For ZB the book and price-path features are thin; the economic calendar (CPI, NFP, FOMC, auctions) and yield/curve context are not in the state yet.
