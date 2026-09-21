@@ -26,6 +26,8 @@ A futures trader for Interactive Brokers, separate from the Monad bot: same `Mod
     backtest/engine.ts  runBacktest: the live FuturesTrader on a replay clock, SimExecution as the exchange
     backtest/report.ts  round trips, PnL breakdown, drawdown, daily Sharpe, buy and hold; summary/trades/equity files
     backtest/cli.ts     bun run backtest
+    backtest/analyze.ts bun run analyze: how good a model's calls are, one log or several side by side
+    backtest/logged.ts  LoggedModel: replays the live model's logged answers in a backtest
     backtest/record.ts  bun run record: live IBKR quotes and prints into the tick store
     backtest/fetch.ts   bun run fetch-ticks: IBKR historical ticks into the tick store
     backtest/synth.ts   seeded random-walk ticks for trying it and for tests
@@ -87,11 +89,27 @@ Every `FUT_DECISION_S` seconds, per root (roots are staggered across the interva
 6. If the target differs from the position and nothing is in flight: one IOC limit at the touch (plus `FUT_SLIP_TICKS`) for the difference. A flip is one order. Orders that reduce the position pull the stop first so both cannot fill.
 7. Keep exactly one GTC stop covering the whole position, `FUT_STOP_TICKS_<ROOT>` from the average entry. It lives at the broker, so it protects the position if this process dies.
 
-Position and PnL come from fills (with real commissions on IBKR). An order counts as settled only when its final status and all its fills have arrived, since IBKR sends them separately and in either order. Every cycle is written to `data/futures-events.jsonl` and streamed on `/events`.
+Position and PnL come from fills (with real commissions on IBKR). An order counts as settled only when its final status and all its fills have arrived, since IBKR sends them separately and in either order. Every cycle is written to `data/futures-events.jsonl` and streamed on `/events`, every model call with its input to `data/futures-decisions.jsonl`, and every fill (price, commission, position after) to `data/futures-fills.jsonl` (the prefix is `FUT_LOG_NAME`).
+
+## Model input versions and side-by-side tests
+
+`FUT_STATE` picks what the model sees. **v1** is the original: returns in basis points, trade flow, top-of-book sizes and imbalance. **v2** was built after the first paper session showed v1 answers following the past 5 minutes (+0.50 correlation) far more than the next 5 (+0.08) and buying after bursts: it drops the book sizes (they flipped sign on half of consecutive calls), gives every recent move in ticks and in units of that window's typical move, adds where price sits in its 30 and 60 minute range and against its 60 minute average, keeps trade flow as a share of volume, and says how long the position has been held and whether the US cash session is open. Its instructions ask the model to judge whether a move continues or partly reverses rather than assume it continues.
+
+To compare them on the same market, run a second instance in simulation next to the paper bot, with its own client id, port and logs:
+
+    FUT_EXEC=sim FUT_STATE=v2 IB_CLIENT_ID=40 FUT_PORT=3002 FUT_LOG_NAME=futures-v2 caffeinate -is bun run futures
+
+Then compare the calls, and the trading on the same fill model:
+
+    bun run analyze --decisions data/futures-decisions.jsonl,data/futures-v2-decisions.jsonl
+    bun run backtest --replay data/futures-decisions.jsonl --latency 400
+    bun run backtest --replay data/futures-v2-decisions.jsonl --latency 400
+
+`analyze` scores the calls over the time both logs overlap: hit rate, correlation of P(up) with the past and the next 5 minutes (chasing shows as high past, low next), the move after each probability level, and ticks captured by strong calls against the round trip cost. The replay backtests put both through the same rules and simulated fills, which is fairer than comparing the paper bot's real fills with the simulation's optimistic ones. One session is noise; decide on several.
 
 ## Running
 
-    bun run test:futures                        # 60 tests, no broker needed
+    bun run test:futures                        # 65 tests, no broker needed
     FUT_ROOTS=MES,MNQ,ZB bun run futures        # sim: real quotes, simulated fills
     FUT_EXEC=ibkr bun run futures               # orders to the IBKR paper account on IB_PORT
     MODEL=jev TYPESAFE_AI_API_KEY=... bun run futures   # Jev instead of the mock
@@ -104,7 +122,7 @@ The backtester replays recorded quotes through the **same** `FuturesTrader`, pol
 
 **1. Get ticks.** Either record them live, or download a window of history:
 
-    bun run record                                   # leave running; FUT_ROOTS, real-time data needed
+    bun run record                                   # leave running; FUT_ROOTS (or --roots MES,ZB), real-time data needed
     bun run fetch-ticks --root MES --from 2026-09-22T13:30:00Z --to 2026-09-22T16:00:00Z
 
 Both write `data/ticks/<ROOT>/<CODE>/<trading day>.jsonl` (format in `backtest/format.ts`; `.jsonl.gz` also reads). The recorder is the better source: it captures exactly what the live bot sees, and records the next contract too from 10 days before a roll. `fetch-ticks` is limited by IBKR (1000 ticks a request, about 60 requests per 10 minutes, whole-second stamps), so it suits hours, not months. Data from any vendor can be converted to the same format.

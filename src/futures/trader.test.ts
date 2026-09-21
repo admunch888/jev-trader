@@ -188,6 +188,29 @@ describe("FuturesTrader", () => {
     expect((decisions[0] as { state: { contract: string } }).state.contract).toBe("MESZ6");
   });
 
+  test("v2 input: moves in units of normal, range and average, no book sizes", async () => {
+    // Two hours of one-minute mids alternating +-1 tick (typical 1-minute move = 1 tick), then a 3-tick burst in the last minute.
+    const start = TUE_0900_CDT.getTime() - 120 * 60_000;
+    const bars = Array.from({ length: 119 }, (_, i) => ({ ts: start + i * 60_000, open: 0, high: 0, low: 0, close: 5700 + (i % 2) * 0.25, volume: 0 }));
+    const v2 = new FuturesTrader({ root: "MES", md, ex, model, guard: new RiskGuard(1_000), cfg: { ...baseCfg, stateVersion: "v2" }, liveOrders: false, now: () => clock, onEvent: (e) => events.push(e), log: () => {} });
+    md.seedBars(c, bars);
+    await v2.start();
+    md.setQuote(c, 5700.75, 5701); // mid 5700.875: 3.5 ticks above the last close
+    model.p = 0.5;
+    await v2.cycle();
+    const s = model.last as import("./model").FuturesTradeStateV2;
+    expect(s.version).toBe(2);
+    expect("bookImbalance" in s).toBe(false);
+    expect(s.typicalMoveTicks.m1).toBeGreaterThan(0.9); // about 1 tick; the burst itself adds a little
+    expect(s.typicalMoveTicks.m1).toBeLessThan(1.2);
+    expect(s.moves.m1.ticks).toBe(3.5);
+    expect(s.moves.m1.sigma).toBeGreaterThan(3); // a burst, and it says so
+    expect(s.range.m30.position).toBe(1); // at the top of its 30 minute range
+    expect(s.vsAverage60.ticks).toBe(3); // 5700.875 against a 60 minute average of 5700.125
+    expect(s.cashSession).toBe(true); // Tue 09:00 Chicago
+    expect(s.position.heldMinutes).toBeNull();
+  });
+
   test("model timeout holds the position", async () => {
     model.hang = true;
     const e = await cycleAt(0.9);

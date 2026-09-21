@@ -1,7 +1,7 @@
 /**
- * bun run record [--data data/ticks]
+ * bun run record [--data data/ticks] [--roots MES,ZB]
  *
- * Records live IBKR quotes and prints for FUT_ROOTS into the tick store, one file per contract per trading day,
+ * Records live IBKR quotes and prints for --roots (default FUT_ROOTS) into the tick store, one file per contract per trading day,
  * for replay with `bun run backtest`. Records the front contract, and also the next one from 10 days before the
  * roll so a backtest can roll across. Leave it running (IB Gateway restarts nightly; IbkrMarketData reconnects).
  *
@@ -15,7 +15,9 @@ import { IbkrMarketData } from "../ibkr/marketData";
 import type { FuturesContract, Root } from "../types";
 import { TickWriter } from "./format";
 
-const { values: a } = parseArgs({ args: Bun.argv.slice(2), options: { data: { type: "string", default: "data/ticks" } } });
+const { values: a } = parseArgs({ args: Bun.argv.slice(2), options: { data: { type: "string", default: "data/ticks" }, roots: { type: "string" } } });
+const roots = (a.roots ? a.roots.split(",").map((s) => s.trim().toUpperCase()) : futuresConfig.roots) as Root[];
+for (const r of roots) if (!(r in SPECS)) throw new Error(`unknown root ${r}`);
 const md = new IbkrMarketData();
 await md.connect();
 const writer = new TickWriter(a.data!, "ibkr-live");
@@ -54,7 +56,7 @@ async function watch(root: Root, c: FuturesContract) {
 /** Front contract, plus the next listed one once the front is within 10 days of its roll. */
 async function refresh() {
   const now = new Date();
-  for (const root of futuresConfig.roots) {
+  for (const root of roots) {
     const front = await md.resolve(root, now);
     await watch(root, front);
     if (now >= addDays(front.calendar.rollDate, -10)) {

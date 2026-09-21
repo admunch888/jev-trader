@@ -31,7 +31,8 @@ if (cfg.exec === "ibkr" && cfg.cancelOnStart) {
   await ex.cancelAll();
 }
 
-const model = createFuturesModel();
+const model = createFuturesModel(cfg.stateVersion);
+const logFile = (kind: string) => `data/${cfg.logName}-${kind}.jsonl`;
 const guard = new RiskGuard(cfg.dailyLossUsd);
 const traders: FuturesTrader[] = [];
 const allHistory = () => traders.flatMap((t) => t.history).sort((a, b) => a.ts - b.ts);
@@ -41,10 +42,11 @@ for (const root of cfg.roots) {
   const t = new FuturesTrader({
     root, md, ex, model, guard, cfg,
     liveOrders: cfg.exec === "ibkr",
-    onEvent: (e) => { server.broadcastCycle(e); appendFileSync("data/futures-events.jsonl", JSON.stringify(e) + "\n"); logCycle(e); },
-    onDecision: (r) => appendFileSync("data/futures-decisions.jsonl", JSON.stringify(r) + "\n"),
+    onEvent: (e) => { server.broadcastCycle(e); appendFileSync(logFile("events"), JSON.stringify(e) + "\n"); logCycle(e); },
+    onDecision: (r) => appendFileSync(logFile("decisions"), JSON.stringify({ ...r, stateVersion: cfg.stateVersion }) + "\n"),
     onFill: (f, p) => {
       server.broadcastFill(f);
+      appendFileSync(logFile("fills"), JSON.stringify({ ...f, root: p.root, exec: cfg.exec, positionAfter: p.qty, avgPriceAfter: p.avgPrice }) + "\n");
       const spec = SPECS[p.root];
       console.log(`[${p.root}] FILL ${f.side} ${f.qty} ${f.contract} @ ${formatPrice(spec, f.price)} fee ${f.commission ?? "?"} -> position ${p.qty}${p.avgPrice !== null ? ` @ ${formatPrice(spec, p.avgPrice)}` : ""}`);
     },
@@ -57,7 +59,7 @@ for (const root of cfg.roots) {
 
 const mode = cfg.exec === "sim" ? "SIM (no orders sent)" : isPaperPort(ibConfig.port) ? "IBKR PAPER" : "IBKR LIVE";
 console.log(`futures · ${mode} · model=${model.name} · roots ${cfg.roots.join(",")} · every ${cfg.decisionSeconds}s · horizon ${cfg.horizonMinutes}m · qty ${cfg.qty} max ${cfg.maxContracts} · daily loss $${cfg.dailyLossUsd} · :${cfg.port}`);
-console.log(`policy · enter ${cfg.enterProb} · flat band ${cfg.flatBand} · average of ${cfg.smoothN} · min hold ${cfg.minHoldMinutes}m · flips ${cfg.allowFlip ? "allowed" : "go flat first"} · decisions logged to data/futures-decisions.jsonl`);
+console.log(`policy · enter ${cfg.enterProb} · flat band ${cfg.flatBand} · average of ${cfg.smoothN} · min hold ${cfg.minHoldMinutes}m · flips ${cfg.allowFlip ? "allowed" : "go flat first"} · model input ${cfg.stateVersion} · logs data/${cfg.logName}-{events,decisions,fills}.jsonl`);
 
 // Startup data check: say plainly what is flowing per root, and what the bot does if it is not.
 setTimeout(() => {

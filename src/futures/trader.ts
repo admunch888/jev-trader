@@ -2,7 +2,7 @@ import { config } from "../config";
 import type { Action, Model } from "../model";
 import type { FuturesConfig } from "./config";
 import { pnlUsd, roundToTick, SPECS } from "./contracts";
-import type { FuturesTradeState } from "./model";
+import type { FuturesTradeState, FuturesTradeStateV2, Move } from "./model";
 import { clampTarget, RiskGuard, shapeTarget, smoothed, targetFromProbability, type Gate, type Gates, type Shape } from "./policy";
 import type { BookSnapshot, ContractSpec, ExecFill, Execution, FuturesContract, MarketData, OrderState, OrderUpdate, Print, Root, Side } from "./types";
 
@@ -536,6 +536,7 @@ export class FuturesTrader {
   }
 
   private buildState(now: Date, book: BookSnapshot, gates: Gates): FuturesTradeState {
+    if (this.d.cfg.stateVersion === "v2") return this.buildStateV2(now, book, gates);
     const spec = this.spec, cfg = this.d.cfg, t = now.getTime();
     const ret = (min: number) => {
       const then = this.midAt(t - min * 60_000);
@@ -578,6 +579,77 @@ export class FuturesTrader {
         contracts: Math.abs(this.pos.qty),
         entry: this.pos.qty ? this.pos.avg : null,
         unrealizedTicks: this.pos.qty ? round(((exit - this.pos.avg) / spec.tickSize) * Math.sign(this.pos.qty), 1) : 0,
+      },
+      session: { minutesToClose: close?.minutes ?? null, closeIsWeekend: close?.weekend ?? false },
+      allowed: {
+        buy: clampTarget(this.pos.qty + cfg.qty, this.pos.qty, gates).target > this.pos.qty,
+        sell: clampTarget(this.pos.qty - cfg.qty, this.pos.qty, gates).target < this.pos.qty,
+      },
+    };
+  }
+
+  /** v2 input: moves in units of normal, range and average context, no book sizes. See `FuturesTradeStateV2`. */
+  private buildStateV2(now: Date, book: BookSnapshot, gates: Gates): FuturesTradeStateV2 {
+    const spec = this.spec, cfg = this.d.cfg, t = now.getTime();
+    const ticks = (px: number) => px / spec.tickSize;
+    // One mid per minute, oldest first, ending now.
+    const minutes = (n: number) => {
+      const out: number[] = [];
+      for (let k = n; k >= 1; k--) { const m = this.midAt(t - k * 60_000); if (m !== null) out.push(m); }
+      out.push(book.mid);
+      return out;
+    };
+    const last2h = minutes(120);
+    const steps = last2h.slice(1).map((m, i) => ticks(m - last2h[i]!));
+    const sd1 = steps.length >= 20 ? Math.sqrt(steps.reduce((a, x) => a + x * x, 0) / steps.length) : null;
+    const typical = (w: number) => (sd1 ? round(sd1 * Math.sqrt(w), 2) : null);
+    const move = (w: number): Move => {
+      const then = this.midAt(t - w * 60_000);
+      const tk = then === null ? 0 : round(ticks(book.mid - then), 1);
+      const typ = typical(w);
+      return { ticks: tk, sigma: typ && then !== null ? round(tk / typ, 2) : null };
+    };
+    const range = (w: number) => {
+      const xs = minutes(w);
+      const hi = Math.max(...xs), lo = Math.min(...xs);
+      return { position: xs.length >= 5 && hi > lo ? round((book.mid - lo) / (hi - lo), 2) : null, widthTicks: round(ticks(hi - lo), 1) };
+    };
+    const hour = minutes(60);
+    const avgTicks = round(ticks(book.mid - hour.reduce((a, b) => a + b, 0) / hour.length), 1);
+    const typ15 = typical(15);
+    const recent = minutes(30).map((m) => String(round(m, 5)));
+    const horizonPrints = this.prints.filter((p) => p.ts >= t - cfg.horizonMinutes * 60_000);
+    const vol = horizonPrints.reduce((a, p) => a + p.size, 0);
+    const net = horizonPrints.reduce((a, p) => a + (p.side === "buy" ? p.size : p.side === "sell" ? -p.size : 0), 0);
+    const exit = this.pos.qty > 0 ? book.bid : book.ask;
+    const close = spec.session.nextClose(now);
+    const parts = Object.fromEntries(CHICAGO_CLOCK.formatToParts(now).map((p) => [p.type, p.value]));
+    const hm = Number(parts.hour) * 60 + Number(parts.minute);
+    return {
+      version: 2,
+      market: `${this.contract.code} ${spec.name} (${spec.exchange})`,
+      root: this.d.root,
+      contract: this.contract.code,
+      timeChicago: `${parts.weekday} ${parts.hour}:${parts.minute}`,
+      cashSession: !["Sat", "Sun"].includes(parts.weekday!) && hm >= 8 * 60 + 30 && hm < 15 * 60,
+      horizonMinutes: cfg.horizonMinutes,
+      decisionEverySeconds: cfg.decisionSeconds,
+      tick: { size: spec.tickSize, valueUsd: spec.tickValue },
+      mid: book.mid,
+      spreadTicks: book.spreadTicks,
+      costTicks: round(book.spreadTicks + (2 * spec.estFeesPerSide) / spec.tickValue, 2),
+      typicalMoveTicks: { m1: typical(1), m5: typical(5), m15: typ15 },
+      moves: { m1: move(1), m5: move(5), m15: move(15), m60: move(60) },
+      range: { m30: range(30), m60: range(60) },
+      vsAverage60: { ticks: avgTicks, sigma: typ15 ? round(avgTicks / typ15, 2) : null },
+      recentMids: recent.join(" "),
+      flow: { share: vol ? round(net / vol, 2) : null, contracts: vol },
+      position: {
+        side: this.pos.qty > 0 ? "long" : this.pos.qty < 0 ? "short" : "flat",
+        contracts: Math.abs(this.pos.qty),
+        entry: this.pos.qty ? this.pos.avg : null,
+        unrealizedTicks: this.pos.qty ? round(((exit - this.pos.avg) / spec.tickSize) * Math.sign(this.pos.qty), 1) : 0,
+        heldMinutes: this.openedAt === null ? null : round((t - this.openedAt) / 60_000, 1),
       },
       session: { minutesToClose: close?.minutes ?? null, closeIsWeekend: close?.weekend ?? false },
       allowed: {

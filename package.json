@@ -24,6 +24,7 @@
     "test:futures": "bun test src/futures",
     "backtest": "bun run src/futures/backtest/cli.ts",
     "record": "bun run src/futures/backtest/record.ts",
-    "fetch-ticks": "bun run src/futures/backtest/fetch.ts"
+    "fetch-ticks": "bun run src/futures/backtest/fetch.ts",
+    "analyze": "bun run src/futures/backtest/analyze.ts"
   }
 }

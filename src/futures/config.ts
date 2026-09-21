@@ -32,6 +32,10 @@ export const futuresConfig = {
   minHoldMinutes: num("FUT_MIN_HOLD_MIN", num("FUT_HORIZON_MIN", 5)),
   /** false: a signal against the position goes flat first; the other side needs its own signal on a later cycle. */
   allowFlip: env("FUT_ALLOW_FLIP", "false") === "true",
+  /** Model input version: v1 (original) or v2 (moves in units of normal, range and average context, no book sizes). */
+  stateVersion: (env("FUT_STATE", "v1") === "v2" ? "v2" : "v1") as "v1" | "v2",
+  /** Log file prefix under data/: <name>-events.jsonl, <name>-decisions.jsonl, <name>-fills.jsonl. Give a side-by-side instance its own. */
+  logName: env("FUT_LOG_NAME", "futures")!,
   /** Entries and exits are IOC limits at the touch plus this many ticks. */
   slipTicks: num("FUT_SLIP_TICKS", 0),
   /** No new risk when the spread is wider than this. */
