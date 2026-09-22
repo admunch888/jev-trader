@@ -27,6 +27,7 @@ const baseCfg: FuturesConfig = {
   ...futuresConfig, roots: ["MES"], exec: "sim", decisionSeconds: 30, horizonMinutes: 5, modelTimeoutMs: 50,
   qty: 1, maxContracts: 1, enterProb: 0.6, flatBand: 0.05, smoothN: 1, minHoldMinutes: 0, allowFlip: true, slipTicks: 0, maxSpreadTicks: 2, stopTicks: () => 16,
   dailyLossUsd: 1_000, entryCutoffMinutes: 10, flattenBeforeWeekendMinutes: 15, reconcileEveryCycles: 1_000, orderTimeoutMs: 30_000, depthRows: 0,
+  chaseSigma: 0, chaseMinutes: 5, takeProfitTicks: () => 0, trailStartTicks: () => 0, trailTicks: () => 0, entryMode: "cross", passiveCycles: 2,
 };
 
 let md: ManualMarketData, ex: SimExecution, model: ScriptedModel, trader: FuturesTrader, c: FuturesContract;
@@ -229,6 +230,105 @@ describe("FuturesTrader", () => {
     const s = model.last as import("./model").FuturesTradeStateV2;
     expect(s.typicalMoveTicks.m1).toBeGreaterThan(0.9); // counting the break as flat minutes would give about 0.7
     expect(s.cashSession).toBe(false);
+  });
+
+  test("chase filter: no entry after an outsized move that way, entries the other way and exits pass", async () => {
+    // Two hours of +-1 tick one-minute mids (typical 5 minute move about 2.2 ticks), then 8 ticks up in the last 5 minutes.
+    const start = TUE_0900_CDT.getTime() - 120 * 60_000;
+    const bars = Array.from({ length: 115 }, (_, i) => ({ ts: start + i * 60_000, open: 0, high: 0, low: 0, close: 5700 + (i % 2) * 0.25, volume: 0 }));
+    for (let k = 1; k <= 4; k++) bars.push({ ts: start + (114 + k) * 60_000, open: 0, high: 0, low: 0, close: 5700 + k * 0.5, volume: 0 });
+    await setup({ chaseSigma: 1.5 });
+    const t2 = new FuturesTrader({ root: "MES", md, ex, model, guard: new RiskGuard(1_000), cfg: { ...baseCfg, chaseSigma: 1.5 }, liveOrders: false, now: () => clock, onEvent: (e) => events.push(e), log: () => {} });
+    md.seedBars(c, bars);
+    await t2.start();
+    md.setQuote(c, 5702, 5702.25);
+    model.p = 0.9;
+    await t2.cycle(); await settle();
+    const e = events.at(-1)!;
+    expect(e.gate).toBe("chase");
+    expect(e.order).toBeNull();
+    expect(e.notes.join(" ")).toContain("not chasing");
+    model.p = 0.1; // selling into the move is not chasing
+    await t2.cycle(); await settle(); await settle();
+    expect(events.at(-1)!.order).toMatchObject({ side: "sell" });
+    expect(t2.position.qty).toBe(-1);
+    t2.stop();
+  });
+
+  test("trailing stop follows the best price once in profit and never loosens", async () => {
+    await setup({ trailStartTicks: () => 4, trailTicks: () => 3 });
+    await cycleAt(0.8); // long 1 @ 5700.25, stop 16 ticks below at 5696.25
+    await cycleAt(0.58);
+    md.setQuote(c, 5701, 5701.25); // +3 ticks: not yet
+    await settle();
+    expect((await cycleAt(0.58)).stop?.price).toBe(5696.25);
+    md.setQuote(c, 5701.5, 5701.75); // bid +5 ticks: trail 3 behind the best bid
+    await settle();
+    expect((await cycleAt(0.58)).stop?.price).toBe(5700.75);
+    md.setQuote(c, 5701.25, 5701.5); // pulls back a tick: the stop stays
+    await settle();
+    expect((await cycleAt(0.58)).stop?.price).toBe(5700.75);
+    md.setQuote(c, 5700.75, 5701); // through the trailed stop
+    await settle(); await settle();
+    expect(trader.position.qty).toBe(0);
+    const e = await cycleAt(0.58);
+    expect(e.totals.realizedUsd).toBe(2.5); // 5700.25 -> 5700.75, 2 ticks kept instead of a loss
+  });
+
+  test("take-profit rests with the stop in one group; when it fills the stop goes", async () => {
+    await setup({ takeProfitTicks: () => 6 });
+    await cycleAt(0.8);
+    const e = await cycleAt(0.58);
+    expect(e.takeProfit).toEqual({ price: 5701.75, qty: 1, state: "working" });
+    expect(e.stop?.price).toBe(5696.25);
+    md.setQuote(c, 5701.75, 5702);
+    await settle(); await settle();
+    expect(trader.position.qty).toBe(0);
+    const after = await cycleAt(0.58);
+    expect(after.stop).toBeNull();
+    expect(after.takeProfit).toBeNull();
+    expect(after.totals.realizedUsd).toBe(7.5); // 6 ticks at the take-profit price, not the touch
+  });
+
+  test("a model exit pulls the take-profit too", async () => {
+    await setup({ takeProfitTicks: () => 6 });
+    await cycleAt(0.8);
+    await cycleAt(0.58);
+    const exit = await cycleAt(0.5);
+    expect(exit.order).toMatchObject({ side: "sell" });
+    const after = await cycleAt(0.5);
+    expect(trader.position.qty).toBe(0);
+    expect(after.takeProfit).toBeNull();
+    expect(after.stop).toBeNull();
+  });
+
+  test("passive entry rests at our own touch, and is cancelled when unfilled or no longer wanted", async () => {
+    await setup({ entryMode: "passive", passiveCycles: 2 });
+    const e = await cycleAt(0.8);
+    expect(e.order).toMatchObject({ side: "buy", price: 5700 }); // at the bid, not the ask
+    expect(trader.position.qty).toBe(0);
+    expect((await cycleAt(0.8)).notes.join(" ")).toContain("resting at 5700");
+    const gone = await cycleAt(0.8);
+    expect(gone.notes.join(" ")).toContain("unfilled after 2 cycles");
+    expect(trader.position.qty).toBe(0);
+    const again = await cycleAt(0.8); // a fresh one at the current bid
+    expect(again.order).toMatchObject({ side: "buy", price: 5700 });
+    const unwanted = await cycleAt(0.5);
+    expect(unwanted.notes.join(" ")).toContain("no longer wanted");
+  });
+
+  test("passive entry fills when the market comes to it, then exits cross", async () => {
+    await setup({ entryMode: "passive" });
+    await cycleAt(0.8);
+    md.setQuote(c, 5699.75, 5700); // offered down to our bid
+    await settle(); await settle();
+    expect(trader.position).toEqual({ qty: 1, avgPrice: 5700 });
+    const held = await cycleAt(0.8);
+    expect(held.stop?.price).toBe(5696);
+    const exit = await cycleAt(0.5);
+    expect(exit.order).toMatchObject({ side: "sell", price: 5699.75 }); // exit at the bid, IOC
+    await settle();
+    expect(trader.position.qty).toBe(0);
   });
 
   test("model timeout holds the position", async () => {

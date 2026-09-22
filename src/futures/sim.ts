@@ -32,6 +32,7 @@ interface SimOrder { id: number; req: OrderRequest; state: OrderState; filled: n
  *   limit, marketable  fills at the touch (a buy limit at or above the ask fills at the ask)
  *   limit, otherwise   IOC cancels; DAY/GTC rests and fills at its price once the touch reaches it
  *   stop               triggers when the touch reaches it (buy stop: ask >= stop) and fills at that touch, so gaps slip
+ * Orders sharing an `oca` group: once one fills, the others still working are cancelled at once.
  * With `respectSize`, marketable fills are capped at the displayed touch size. Fees are the spec's
  * `estFeesPerSide` per contract. Status messages go out before their fills, the awkward order IBKR also uses.
  */
@@ -175,6 +176,11 @@ export class SimExecution implements Execution {
     else if (o.req.tif === "ioc" || kind !== "limit") o.state = "cancelled"; // IOC remainder, or a market/stop sweep we do not walk past the touch
     else o.state = "partial";
     this.emitOrder(o, undefined, fillAt);
+    if (o.req.oca) {
+      for (const other of this.orders.values()) {
+        if (other !== o && other.req.oca === o.req.oca && !isDone(other.state)) { other.state = "cancelled"; this.emitOrder(other); }
+      }
+    }
     return true;
   }
 

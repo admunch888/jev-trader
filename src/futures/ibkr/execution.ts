@@ -270,6 +270,7 @@ export class IbkrExecution implements Execution {
       tif: req.tif === "gtc" ? "GTC" : req.tif === "ioc" ? "IOC" : "DAY",
       orderRef: req.ref,
       transmit: true,
+      ...(req.oca ? { ocaGroup: req.oca, ocaType: 1 } : {}), // 1: cancel the rest of the group once one fills
       ...(ibConfig.account ? { account: ibConfig.account } : {}),
     };
   }

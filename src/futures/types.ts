@@ -170,6 +170,8 @@ export interface OrderRequest {
   /** Limit price, or trigger for a stop. Must sit on the tick grid. */
   price?: number;
   tif: TimeInForce;
+  /** One-cancels-all group: when an order in the group fills, the broker cancels the others (a stop and its take-profit). */
+  oca?: string;
   /** Attach an OCA take-profit limit and stop-loss stop, as absolute prices. Children get refs `${ref}:tp` and `${ref}:sl`. */
   bracket?: { takeProfit: number; stopLoss: number };
 }

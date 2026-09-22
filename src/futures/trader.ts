@@ -3,7 +3,7 @@ import type { Action, Model } from "../model";
 import type { FuturesConfig } from "./config";
 import { pnlUsd, roundToTick, SPECS } from "./contracts";
 import type { FuturesTradeState, FuturesTradeStateV2, Move } from "./model";
-import { clampTarget, RiskGuard, shapeTarget, smoothed, targetFromProbability, type Gate, type Gates, type Shape } from "./policy";
+import { chaseFilter, clampTarget, RiskGuard, shapeTarget, smoothed, targetFromProbability, type Gate, type Gates, type Shape } from "./policy";
 import type { BookSnapshot, ContractSpec, ExecFill, Execution, FuturesContract, MarketData, OrderState, OrderUpdate, Print, Root, Side } from "./types";
 
 export interface FuturesEvent {
@@ -33,6 +33,7 @@ export interface FuturesEvent {
   order: { ref: string; side: Side; qty: number; price: number } | null;
   position: { qty: number; avgPrice: number | null; unrealizedUsd: number };
   stop: { price: number; qty: number; state: OrderState } | null;
+  takeProfit: { price: number; qty: number; state: OrderState } | null;
   totals: Totals;
   halted: string | null;
   notes: string[];
@@ -84,7 +85,10 @@ export interface TraderDeps {
 
 interface Tracked {
   ref: string;
-  role: "entry" | "stop";
+  role: "entry" | "stop" | "tp";
+  /** An entry resting at our own touch (FUT_ENTRY=passive), cancelled if still unfilled after `passiveCycles` cycles. */
+  passive: boolean;
+  placedCycle: number;
   side: Side;
   qty: number;
   price: number;
@@ -94,6 +98,8 @@ interface Tracked {
   /** Filled quantity we have applied from fills. The order is settled once it is final and these agree. */
   applied: number;
   sentAt: number;
+  /** Cancelled (entries) or dropped and reconciled (anything) if it has no final status by then. */
+  deadline: number;
   cancelling: boolean;
 }
 
@@ -111,7 +117,11 @@ const CHICAGO_CLOCK = new Intl.DateTimeFormat("en-US", { timeZone: "America/Chic
  *   3. unless a gate already forces the answer, ask the model buy or sell for the next `horizonMinutes`
  *   4. probability -> target position (`targetFromProbability`), then `clampTarget` applies the gates
  *   5. if the target differs from the position and nothing is in flight: one IOC limit at the touch for the difference
- *   6. keep one protective GTC stop for the whole position, `stopTicks` from the average entry
+ *   6. keep one protective GTC stop for the whole position, `stopTicks` from the average entry, trailing the best
+ *      price once `trailStartTicks` in profit, plus an optional take-profit limit in the same one-cancels-all group
+ *
+ * Between 4 and 5 the chase filter can hold back a new position the market has already run in. With
+ * FUT_ENTRY=passive new positions rest at our own touch for a few cycles instead of crossing the spread.
  *
  * Position and PnL come from fills. One cycle runs at a time; a cycle that comes due while the last is still
  * running is recorded as late and skipped, as in the Monad loop.
@@ -128,6 +138,11 @@ export class FuturesTrader {
   private pos = { qty: 0, avg: 0 };
   /** When the current position was opened (or reversed); drives the minimum hold. */
   private openedAt: number | null = null;
+  /** Best exit price seen since the position opened (bid for a long, ask for a short); drives the trailing stop. Null = the entry price. */
+  private best: number | null = null;
+  /** One-cancels-all group for the current position's stop and take-profit. */
+  private oca = "";
+  private ocaSeq = 0;
   /** The model's recent up-probabilities from consecutive cycles, for `smoothN`. */
   private readings: number[] = [];
   private mids: { ts: number; mid: number }[] = [];
@@ -185,8 +200,10 @@ export class FuturesTrader {
     this.emit({ book, notes: [note] });
   }
 
-  /** Send an order to go flat now (shutdown). Stops stay working until the fill lands. */
+  /** Send an order to go flat now (shutdown), after pulling a resting passive entry. Stops stay working until the fill lands. */
   async flatten() {
+    const resting = this.passiveEntry();
+    if (resting && !resting.cancelling) await this.cancelOrder(resting);
     const book = this.d.md.book(this.contract);
     if (this.pos.qty && book && !this.hasUnsettledEntry()) await this.sendTowards(0, book);
   }
@@ -231,6 +248,14 @@ export class FuturesTrader {
           wanted = targetFromProbability(up, this.pos.qty, cfg);
           const heldMs = this.openedAt === null ? null : now.getTime() - this.openedAt;
           ({ target: shaped, shape } = shapeTarget(wanted, this.pos.qty, { allowFlip: cfg.allowFlip, heldMs, minHoldMs: cfg.minHoldMinutes * 60_000 }));
+          if (cfg.chaseSigma && shaped !== this.pos.qty) {
+            const m = this.moveSigma(now.getTime(), book.mid, cfg.chaseMinutes);
+            const c = chaseFilter(shaped, this.pos.qty, m, cfg.chaseSigma);
+            if (c.chased) {
+              shaped = c.target; shape = "chase";
+              notes.push(`already moved ${m} typical ${cfg.chaseMinutes} min moves that way; not chasing`);
+            }
+          }
         }
       } else {
         this.readings = [];
@@ -242,7 +267,16 @@ export class FuturesTrader {
     const gate = clamped.gate ?? shape;
 
     let order: FuturesEvent["order"] = null;
-    if (target !== this.pos.qty) {
+    const resting = this.passiveEntry();
+    if (resting) {
+      const wantSide = target > this.pos.qty ? "buy" : target < this.pos.qty ? "sell" : null;
+      const expired = this.cycleNo - resting.placedCycle >= cfg.passiveCycles;
+      if (resting.cancelling || gates.brokerDown) notes.push(`passive ${resting.side} at ${resting.price} settling`);
+      else if (wantSide !== resting.side || expired) {
+        notes.push(`passive ${resting.side} at ${resting.price} ${expired ? `unfilled after ${cfg.passiveCycles} cycles` : "no longer wanted"}; cancelling`);
+        await this.cancelOrder(resting);
+      } else notes.push(`passive ${resting.side} resting at ${resting.price}`);
+    } else if (target !== this.pos.qty) {
       if (this.hasUnsettledEntry()) notes.push("previous order still settling");
       else order = await this.sendTowards(target, book);
     }
@@ -288,21 +322,29 @@ export class FuturesTrader {
     }
   }
 
-  /** One IOC limit at the touch (plus `slipTicks`) for the whole difference. Reducing orders first pull the stop so both cannot fill. */
+  /**
+   * One IOC limit at the touch (plus `slipTicks`) for the whole difference, or with FUT_ENTRY=passive, a new
+   * position rests at our own touch (a buy at the bid) instead. Reducing orders first pull the stop and
+   * take-profit so they cannot fill as well.
+   */
   private async sendTowards(target: number, book: BookSnapshot): Promise<FuturesEvent["order"]> {
+    const cfg = this.d.cfg;
     const delta = target - this.pos.qty;
     const side: Side = delta > 0 ? "buy" : "sell";
     const qty = Math.abs(delta);
-    const slip = this.d.cfg.slipTicks * this.spec.tickSize;
-    const price = roundToTick(this.spec, side === "buy" ? book.ask + slip : book.bid - slip);
-    if (this.pos.qty && Math.sign(delta) !== Math.sign(this.pos.qty)) {
-      const stop = this.workingStop();
-      if (stop) await this.cancelOrder(stop);
+    const reduces = this.pos.qty !== 0 && Math.sign(delta) !== Math.sign(this.pos.qty);
+    const passive = cfg.entryMode === "passive" && !reduces;
+    const slip = cfg.slipTicks * this.spec.tickSize;
+    const price = passive ? (side === "buy" ? book.bid : book.ask) : roundToTick(this.spec, side === "buy" ? book.ask + slip : book.bid - slip);
+    if (reduces) {
+      for (const role of ["stop", "tp"] as const) { const o = this.workingExit(role); if (o) await this.cancelOrder(o); }
     }
     const ref = this.nextRef("e");
-    this.orders.set(ref, { ref, role: "entry", side, qty, price, state: "pending", reported: 0, applied: 0, sentAt: this.now().getTime(), cancelling: false });
+    const sentAt = this.now().getTime();
+    const rest = passive ? cfg.passiveCycles * cfg.decisionSeconds * 1000 : 0;
+    this.orders.set(ref, { ref, role: "entry", passive, placedCycle: this.cycleNo, side, qty, price, state: "pending", reported: 0, applied: 0, sentAt, deadline: sentAt + rest + cfg.orderTimeoutMs, cancelling: false });
     try {
-      await this.d.ex.place({ ref, contract: this.contract, side, qty, kind: "limit", price, tif: "ioc" });
+      await this.d.ex.place({ ref, contract: this.contract, side, qty, kind: "limit", price, tif: passive ? "day" : "ioc" });
     } catch (e) {
       this.orders.delete(ref);
       this.totals.rejects++;
@@ -313,43 +355,17 @@ export class FuturesTrader {
     return { ref, side, qty, price };
   }
 
-  /** Keep exactly one GTC stop covering the whole position at `stopTicks` from the average entry. Idempotent. */
+  /**
+   * Keep exactly one GTC stop covering the whole position (at `stopPrice`, which trails once in profit) and, if
+   * enabled, one take-profit limit, both in the position's one-cancels-all group. Idempotent.
+   */
   private async maintainStop(book: BookSnapshot | null) {
-    if (this.stopBusy || this.hasUnsettledEntry()) return;
-    if (this.d.ex.status && this.d.ex.status !== "connected") return; // the stop already at IBKR keeps working
+    if (this.stopBusy || this.entryInFlux()) return;
+    if (this.d.ex.status && this.d.ex.status !== "connected") return; // the orders already at IBKR keep working
     this.stopBusy = true;
     try {
-      const stop = this.workingStop();
-      if (!this.pos.qty) {
-        if (stop && !stop.cancelling) await this.cancelOrder(stop);
-        return;
-      }
-      const side: Side = this.pos.qty > 0 ? "sell" : "buy";
-      const qty = Math.abs(this.pos.qty);
-      const price = this.stopPrice();
-      if (stop?.cancelling) return;
-      if (stop && stop.side !== side) {
-        await this.cancelOrder(stop); // the replacement goes on once this cancel settles
-        return;
-      }
-      if (stop) {
-        if (stop.qty === qty && stop.price === price) return;
-        await this.d.ex.modify(stop.ref, { price, qty });
-        stop.qty = qty; stop.price = price;
-        return;
-      }
-      if ([...this.orders.values()].some((o) => o.role === "stop")) return; // a filled or cancelled stop is still settling
-      if (book && (side === "sell" ? price >= book.bid : price <= book.ask)) return; // already through: the stop-breached gate flattens
-      const ref = this.nextRef("s");
-      this.orders.set(ref, { ref, role: "stop", side, qty, price, state: "pending", reported: 0, applied: 0, sentAt: this.now().getTime(), cancelling: false });
-      try {
-        await this.d.ex.place({ ref, contract: this.contract, side, qty, kind: "stop", price, tif: "gtc" });
-        this.totals.orders++;
-      } catch (e) {
-        this.orders.delete(ref);
-        this.totals.rejects++;
-        this.log(`stop ${ref} not sent: ${(e as Error).message}`);
-      }
+      await this.keepExit("stop", this.stopPrice(), book);
+      await this.keepExit("tp", this.takeProfitPrice(), book);
     } catch (e) {
       this.log(`stop maintenance failed: ${(e as Error).message}`);
     } finally {
@@ -357,16 +373,76 @@ export class FuturesTrader {
     }
   }
 
-  private stopPrice() {
-    const dist = this.d.cfg.stopTicks(this.d.root) * this.spec.tickSize;
-    return roundToTick(this.spec, this.pos.qty > 0 ? this.pos.avg - dist : this.pos.avg + dist);
+  private async keepExit(role: "stop" | "tp", price: number | null, book: BookSnapshot | null) {
+    const o = this.workingExit(role);
+    if (!this.pos.qty || price === null) {
+      if (o && !o.cancelling) await this.cancelOrder(o);
+      return;
+    }
+    const side: Side = this.pos.qty > 0 ? "sell" : "buy";
+    const qty = Math.abs(this.pos.qty);
+    // A stop already at or through the touch would trigger at once: leave it (or the old one) and let the stop-breached gate exit.
+    const through = role === "stop" && !!book && (side === "sell" ? price >= book.bid : price <= book.ask);
+    if (o?.cancelling) return;
+    if (o && o.side !== side) {
+      await this.cancelOrder(o); // the replacement goes on once this cancel settles
+      return;
+    }
+    if (o) {
+      if ((o.qty === qty && o.price === price) || through) return;
+      await this.d.ex.modify(o.ref, { price, qty });
+      o.qty = qty; o.price = price;
+      return;
+    }
+    if ([...this.orders.values()].some((x) => x.role === role)) return; // a filled or cancelled one is still settling
+    if (through) return;
+    const ref = this.nextRef(role === "stop" ? "s" : "t");
+    const sentAt = this.now().getTime();
+    this.orders.set(ref, { ref, role, passive: false, placedCycle: this.cycleNo, side, qty, price, state: "pending", reported: 0, applied: 0, sentAt, deadline: sentAt + this.d.cfg.orderTimeoutMs, cancelling: false });
+    try {
+      await this.d.ex.place({ ref, contract: this.contract, side, qty, kind: role === "stop" ? "stop" : "limit", price, tif: "gtc", oca: this.oca });
+      this.totals.orders++;
+    } catch (e) {
+      this.orders.delete(ref);
+      this.totals.rejects++;
+      this.log(`${role === "stop" ? "stop" : "take-profit"} ${ref} not sent: ${(e as Error).message}`);
+    }
   }
 
-  /** Price is through our stop level and no stop is working to catch it (never placed, rejected, or cancelled for an exit that missed). */
+  /** `stopTicks` from the average entry; once the best price since entry is `trailStartTicks` in profit, `trailTicks` behind that best, whichever is tighter. */
+  private stopPrice() {
+    const cfg = this.d.cfg, root = this.d.root, tick = this.spec.tickSize, dir = Math.sign(this.pos.qty);
+    const base = this.pos.avg - dir * cfg.stopTicks(root) * tick;
+    const start = cfg.trailStartTicks(root), trail = cfg.trailTicks(root);
+    if (start > 0 && trail > 0 && this.best !== null && ((this.best - this.pos.avg) * dir) / tick >= start - 1e-9) {
+      const trailed = this.best - dir * trail * tick;
+      return roundToTick(this.spec, dir > 0 ? Math.max(base, trailed) : Math.min(base, trailed));
+    }
+    return roundToTick(this.spec, base);
+  }
+
+  private takeProfitPrice() {
+    const tp = this.d.cfg.takeProfitTicks(this.d.root);
+    return tp > 0 ? roundToTick(this.spec, this.pos.avg + Math.sign(this.pos.qty) * tp * this.spec.tickSize) : null;
+  }
+
+  /** Price is at or through our stop level and no stop is working there to catch it (never placed, rejected, cancelled for an exit that missed, or a trail the market jumped past). */
   private stopBreached(book: BookSnapshot) {
-    if (!this.pos.qty || this.workingStop()) return false;
+    if (!this.pos.qty) return false;
     const p = this.stopPrice();
-    return this.pos.qty > 0 ? book.bid <= p : book.ask >= p;
+    if (!(this.pos.qty > 0 ? book.bid <= p : book.ask >= p)) return false;
+    return this.workingExit("stop")?.price !== p;
+  }
+
+  /** Every quote: track the best exit price for the trailing stop, and move the stop as soon as the trail moves. */
+  private onBookTick(b: BookSnapshot) {
+    if (!this.pos.qty) return;
+    const exit = this.pos.qty > 0 ? b.bid : b.ask;
+    const best = this.best ?? this.pos.avg;
+    if ((exit - best) * Math.sign(this.pos.qty) <= 0) return;
+    this.best = exit;
+    const stop = this.workingExit("stop");
+    if (stop && !stop.cancelling && stop.price !== this.stopPrice()) void this.maintainStop(b);
   }
 
   private async cancelOrder(o: Tracked) {
@@ -421,10 +497,14 @@ export class FuturesTrader {
     this.markOpened(before, p.qty);
   }
 
-  /** A position that starts from flat, or reverses, starts its minimum hold now; going flat clears it. */
+  /** A position that starts from flat, or reverses, starts its minimum hold, trail and one-cancels-all group now; going flat clears them. */
   private markOpened(before: number, after: number) {
-    if (!after) this.openedAt = null;
-    else if (!before || Math.sign(before) !== Math.sign(after)) this.openedAt = this.now().getTime();
+    if (!after) { this.openedAt = null; this.best = null; }
+    else if (!before || Math.sign(before) !== Math.sign(after)) {
+      this.openedAt = this.now().getTime();
+      this.best = null;
+      this.oca = `${this.d.root}-oca${++this.ocaSeq}-${Date.now().toString(36)}`;
+    }
   }
 
   // ---------------------------------------------------------------------------------------------------------
@@ -454,17 +534,17 @@ export class FuturesTrader {
     }
   }
 
-  /** Orders with no final status after `orderTimeoutMs` get cancelled; final ones whose fills never arrived are dropped and trigger a reconcile. Working stops are exempt. */
+  /** Orders with no final status by their deadline get cancelled; final ones whose fills never arrived are dropped and trigger a reconcile. Working stops and take-profits are exempt. */
   private expireStale(nowMs: number, notes: string[]) {
     for (const o of this.orders.values()) {
-      if (nowMs - o.sentAt < this.d.cfg.orderTimeoutMs) continue;
-      if (o.role === "stop" && o.state === "working") continue;
+      if (nowMs < o.deadline) continue;
+      if (o.role !== "entry" && o.state === "working") continue;
       if (isTerminal(o.state)) {
         this.orders.delete(o.ref);
         this.needReconcile = true;
         notes.push(`${o.ref}: fills never matched status; reconciling`);
       } else if (!o.cancelling) {
-        notes.push(`${o.ref}: no final status after ${this.d.cfg.orderTimeoutMs} ms; cancelling`);
+        notes.push(`${o.ref}: no final status after ${nowMs - o.sentAt} ms; cancelling`);
         void this.cancelOrder(o);
       } else {
         this.orders.delete(o.ref);
@@ -491,6 +571,7 @@ export class FuturesTrader {
 
   private async attach() {
     await this.d.md.subscribe(this.contract, { depthRows: this.d.cfg.depthRows });
+    this.offContract.push(this.d.md.onBook(this.contract, (b) => this.onBookTick(b)));
     this.offContract.push(this.d.md.onPrint(this.contract, (p) => {
       this.prints.push(p);
       const cutoff = p.ts - this.d.cfg.horizonMinutes * 60_000;
@@ -533,6 +614,37 @@ export class FuturesTrader {
 
   private pnl(book: BookSnapshot) {
     return this.totals.realizedUsd + this.unrealized(book) - this.totals.feesUsd;
+  }
+
+  /**
+   * One mid per minute the market was open over the last `n` minutes, oldest first, ending with `mid` now. Minutes
+   * in the daily break (or a weekend) are skipped: counting them as flat would shrink the typical move and make
+   * every move after the open look like a burst.
+   */
+  private openMinutes(t: number, mid: number, n: number) {
+    const out: number[] = [];
+    for (let k = n; k >= 1; k--) {
+      const ts = t - k * 60_000;
+      if (!this.spec.session.isOpen(new Date(ts))) continue;
+      const m = this.midAt(ts);
+      if (m !== null) out.push(m);
+    }
+    out.push(mid);
+    return out;
+  }
+
+  /** Standard deviation of the 1 minute move over the last 2 hours, in ticks; null with under 20 minutes of history. */
+  private typical1m(t: number, mid: number) {
+    const xs = this.openMinutes(t, mid, 120);
+    const steps = xs.slice(1).map((m, i) => (m - xs[i]!) / this.spec.tickSize);
+    return steps.length >= 20 ? Math.sqrt(steps.reduce((a, x) => a + x * x, 0) / steps.length) : null;
+  }
+
+  /** The move over the last `w` minutes in units of the typical `w` minute move, or null without enough history. */
+  private moveSigma(t: number, mid: number, w: number) {
+    const sd1 = this.typical1m(t, mid);
+    const then = this.midAt(t - w * 60_000);
+    return sd1 && then !== null ? round((mid - then) / this.spec.tickSize / (sd1 * Math.sqrt(w)), 2) : null;
   }
 
   private buildState(now: Date, book: BookSnapshot, gates: Gates): FuturesTradeState {
@@ -592,22 +704,8 @@ export class FuturesTrader {
   private buildStateV2(now: Date, book: BookSnapshot, gates: Gates): FuturesTradeStateV2 {
     const spec = this.spec, cfg = this.d.cfg, t = now.getTime();
     const ticks = (px: number) => px / spec.tickSize;
-    // One mid per minute the market was open, oldest first, ending now. Minutes in the daily break (or a weekend) are
-    // skipped: counting them as flat minutes would shrink the typical move and make every move after the open look like a burst.
-    const minutes = (n: number) => {
-      const out: number[] = [];
-      for (let k = n; k >= 1; k--) {
-        const ts = t - k * 60_000;
-        if (!spec.session.isOpen(new Date(ts))) continue;
-        const m = this.midAt(ts);
-        if (m !== null) out.push(m);
-      }
-      out.push(book.mid);
-      return out;
-    };
-    const last2h = minutes(120);
-    const steps = last2h.slice(1).map((m, i) => ticks(m - last2h[i]!));
-    const sd1 = steps.length >= 20 ? Math.sqrt(steps.reduce((a, x) => a + x * x, 0) / steps.length) : null;
+    const minutes = (n: number) => this.openMinutes(t, book.mid, n);
+    const sd1 = this.typical1m(t, book.mid);
     const typical = (w: number) => (sd1 ? round(sd1 * Math.sqrt(w), 2) : null);
     const move = (w: number): Move => {
       const then = this.midAt(t - w * 60_000);
@@ -670,7 +768,8 @@ export class FuturesTrader {
     decision?: FuturesEvent["decision"]; wanted?: number | null; target?: number | null; gate?: Gate | Shape | null; gateDetail?: string; order?: FuturesEvent["order"];
   }) {
     const b = p.book;
-    const stop = this.workingStop();
+    const stop = this.workingExit("stop");
+    const tp = this.workingExit("tp");
     const e: FuturesEvent = {
       root: this.d.root, model: this.d.model.name, contract: this.contract.code, ts: this.now().getTime(), cycle: this.cycleNo,
       bid: b?.bid ?? null, ask: b?.ask ?? null, mid: b?.mid ?? null, spreadTicks: b?.spreadTicks ?? null, delayed: b?.delayed ?? false,
@@ -680,6 +779,7 @@ export class FuturesTrader {
       order: p.order ?? null,
       position: { qty: this.pos.qty, avgPrice: this.pos.qty ? this.pos.avg : null, unrealizedUsd: round(this.unrealized(b), 2) },
       stop: stop ? { price: stop.price, qty: stop.qty, state: stop.state } : null,
+      takeProfit: tp ? { price: tp.price, qty: tp.qty, state: tp.state } : null,
       totals: { ...this.totals, realizedUsd: round(this.totals.realizedUsd, 2), feesUsd: round(this.totals.feesUsd, 2), jevUsd: round(this.totals.jevUsd, 6), pnlUsd: round(this.totals.pnlUsd, 2), pnlTodayUsd: round(this.totals.pnlTodayUsd, 2) },
       halted: this.d.guard.halted,
       notes: p.notes,
@@ -689,8 +789,8 @@ export class FuturesTrader {
     this.d.onEvent?.(e);
   }
 
-  private workingStop() {
-    for (const o of this.orders.values()) if (o.role === "stop" && !isTerminal(o.state)) return o;
+  private workingExit(role: "stop" | "tp") {
+    for (const o of this.orders.values()) if (o.role === role && !isTerminal(o.state)) return o;
     return null;
   }
 
@@ -699,7 +799,18 @@ export class FuturesTrader {
     return false;
   }
 
-  private nextRef(kind: "e" | "s") {
+  private passiveEntry() {
+    for (const o of this.orders.values()) if (o.role === "entry" && o.passive) return o;
+    return null;
+  }
+
+  /** An entry whose fills can still change the position at any moment, other than a passive one resting on the book (the stop follows its fills). */
+  private entryInFlux() {
+    for (const o of this.orders.values()) if (o.role === "entry" && !(o.passive && (o.state === "working" || o.state === "partial"))) return true;
+    return false;
+  }
+
+  private nextRef(kind: "e" | "s" | "t") {
     return `${this.d.root}-${kind}${++this.refSeq}-${Date.now().toString(36)}`;
   }
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { clampTarget, RiskGuard, shapeTarget, smoothed, targetFromProbability, type Gates } from "./policy";
+import { chaseFilter, clampTarget, RiskGuard, shapeTarget, smoothed, targetFromProbability, type Gates } from "./policy";
 
 const P = { enterProb: 0.6, flatBand: 0.05, qty: 1 };
 const open: Gates = { brokerDown: false, halted: false, roll: false, weekend: false, stopBreached: false, closed: false, noNewRisk: [], maxContracts: 2 };
@@ -62,6 +62,18 @@ describe("anti-churn shaping", () => {
     expect(shapeTarget(-1, 1, young)).toEqual({ target: 1, shape: "min-hold" });
     expect(shapeTarget(2, 1, young)).toEqual({ target: 2, shape: null });
     expect(shapeTarget(0, 1, o)).toEqual({ target: 0, shape: null }); // held long enough
+  });
+});
+
+describe("chase filter", () => {
+  test("blocks new risk in the direction of an outsized move only", () => {
+    expect(chaseFilter(1, 0, 2, 1.5)).toEqual({ target: 0, chased: true });
+    expect(chaseFilter(1, 0, 1, 1.5)).toEqual({ target: 1, chased: false }); // ordinary move
+    expect(chaseFilter(-1, 0, 2, 1.5)).toEqual({ target: -1, chased: false }); // against the move
+    expect(chaseFilter(0, 1, 2, 1.5)).toEqual({ target: 0, chased: false }); // exits pass
+    expect(chaseFilter(1, -1, 2, 1.5)).toEqual({ target: 0, chased: true }); // a flip keeps only the exit
+    expect(chaseFilter(1, 0, null, 1.5)).toEqual({ target: 1, chased: false }); // no history
+    expect(chaseFilter(1, 0, 5, 0)).toEqual({ target: 1, chased: false }); // off
   });
 });
 

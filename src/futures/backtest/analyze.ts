@@ -1,9 +1,9 @@
 /**
  * bun run analyze [--decisions data/futures-decisions.jsonl,data/futures-v2-decisions.jsonl] [--root MES] [--data data/ticks]
- *                 [--from <ISO>] [--to <ISO>] [--all-times]
+ *                 [--from <ISO>] [--to <ISO>] [--all-times] [--horizon <min>]
  *
- * How good are a model's calls, independent of the trading rules? For every logged call, the recorded mid 1 and 5
- * minutes later: hit rate, correlation of P(up) with the past and the next 5 minutes (chasing shows as a high
+ * How good are a model's calls, independent of the trading rules? For every logged call, the recorded mid 1 minute
+ * and `--horizon` minutes (default 5, the question the bot asks) later: hit rate, correlation of P(up) with the past and the next 5 minutes (chasing shows as a high
  * past and a low next), average move after each probability level, and what strong calls captured per call
  * against the round trip cost. With several logs it compares them over the time they overlap (so both face the
  * same market) unless --all-times. Needs the ticks recorded for those times (`bun run record`).
@@ -22,7 +22,7 @@ export interface CallStats {
   strong: number;
   hit1: number | null; hit5: number | null; hitStrong5: number | null;
   corrPast5: number | null; corrNext1: number | null; corrNext5: number | null;
-  /** Average move over the next 5 minutes in the called direction, strong calls only, in ticks (before costs). */
+  /** Average move over the horizon in the called direction, strong calls only, in ticks (before costs). "5" fields are the horizon. */
   capturedStrong5: number | null;
   avgCostTicks: number | null;
   meanSwing: number | null;
@@ -31,8 +31,9 @@ export interface CallStats {
 
 const BUCKETS: [string, number, number][] = [["<=20%", 0, 0.2], ["20-35%", 0.2, 0.35], ["35-65%", 0.35, 0.65], ["65-80%", 0.65, 0.8], [">=80%", 0.8, 1.01]];
 
-/** Score calls against mids (per contract code), in ticks of `tick`. Calls without 5 minutes of prices after them are left out. */
-export function scoreCalls(calls: Call[], mids: Map<string, Series>, tick: number, strongAt = 0.15): CallStats {
+/** Score calls against mids (per contract code), in ticks of `tick`, over `horizonMin`. Calls without that much price history before and after are left out. */
+export function scoreCalls(calls: Call[], mids: Map<string, Series>, tick: number, strongAt = 0.15, horizonMin = 5): CallStats {
+  const H = horizonMin * 60_000;
   const midAt = (code: string, t: number) => {
     const s = mids.get(code);
     if (!s || !s.t.length || t < s.t[0]! || t > s.t.at(-1)!) return null;
@@ -42,7 +43,7 @@ export function scoreCalls(calls: Call[], mids: Map<string, Series>, tick: numbe
   };
   const rows: { up: number; past5: number; f1: number; f5: number; cost: number | null }[] = [];
   for (const c of calls) {
-    const m0 = midAt(c.contract, c.ts), mp = midAt(c.contract, c.ts - 300_000), m1 = midAt(c.contract, c.ts + 60_000), m5 = midAt(c.contract, c.ts + 300_000);
+    const m0 = midAt(c.contract, c.ts), mp = midAt(c.contract, c.ts - H), m1 = midAt(c.contract, c.ts + 60_000), m5 = midAt(c.contract, c.ts + H);
     if (m0 === null || mp === null || m1 === null || m5 === null) continue;
     rows.push({ up: c.up, past5: (m0 - mp) / tick, f1: (m1 - m0) / tick, f5: (m5 - m0) / tick, cost: c.costTicks });
   }
@@ -111,6 +112,7 @@ if (import.meta.main) {
       data: { type: "string", default: "data/ticks" },
       from: { type: "string" }, to: { type: "string" },
       "all-times": { type: "boolean", default: false },
+      horizon: { type: "string", default: "5" },
     },
   });
   const root = a.root!.toUpperCase() as Root;
@@ -125,26 +127,27 @@ if (import.meta.main) {
   const all = inWindow.flatMap((l) => l.calls);
   if (!all.length) throw new Error(`no ${root} calls${logs.length > 1 ? " in the time the logs overlap" : ""}`);
   const lo = Math.min(...all.map((c) => c.ts)), hi = Math.max(...all.map((c) => c.ts));
-  const mids = await loadMids(a.data!, root, lo, hi);
+  const H = Number(a.horizon);
+  const mids = await loadMids(a.data!, root, lo, hi + H * 60_000);
   const iso = (ts: number) => new Date(ts).toISOString().slice(0, 16);
   console.log(`${root} calls ${iso(lo)} to ${iso(hi)} UTC${logs.length > 1 && !a["all-times"] ? " (overlap of all logs)" : ""}; moves in ticks of ${spec.tickSize}`);
 
   const pct = (x: number | null) => (x === null ? "-" : `${(x * 100).toFixed(0)}%`);
   const num = (x: number | null, d = 2) => (x === null ? "-" : `${x >= 0 ? "+" : ""}${x.toFixed(d)}`);
-  const stats = inWindow.map((l) => ({ label: l.label, s: scoreCalls(l.calls, mids, spec.tickSize) }));
+  const stats = inWindow.map((l) => ({ label: l.label, s: scoreCalls(l.calls, mids, spec.tickSize, 0.15, H) }));
   const w = 44;
   const row = (name: string, f: (s: CallStats) => string) => console.log(`  ${name.padEnd(46)}${stats.map((x) => f(x.s).padStart(w)).join("")}`);
   console.log(`  ${"".padEnd(46)}${stats.map((x) => x.label.slice(0, w - 2).padStart(w)).join("")}`);
   row("calls scored (strong: <=35% or >=65%)", (s) => `${s.calls} (${s.strong} strong)`);
-  row("direction right after 1 min / 5 min", (s) => `${pct(s.hit1)} / ${pct(s.hit5)}`);
-  row("strong calls right after 5 min", (s) => pct(s.hitStrong5));
-  row("P(up) vs PAST 5 min (high = chasing)", (s) => num(s.corrPast5));
-  row("P(up) vs NEXT 1 min / 5 min (want high)", (s) => `${num(s.corrNext1)} / ${num(s.corrNext5)}`);
-  row("strong calls: ticks captured in 5 min", (s) => num(s.capturedStrong5, 1));
+  row(`direction right after 1 min / ${H} min`, (s) => `${pct(s.hit1)} / ${pct(s.hit5)}`);
+  row(`strong calls right after ${H} min`, (s) => pct(s.hitStrong5));
+  row(`P(up) vs PAST ${H} min (high = chasing)`, (s) => num(s.corrPast5));
+  row(`P(up) vs NEXT 1 min / ${H} min (want high)`, (s) => `${num(s.corrNext1)} / ${num(s.corrNext5)}`);
+  row(`strong calls: ticks captured in ${H} min`, (s) => num(s.capturedStrong5, 1));
   row("  vs round trip cost (ticks)", (s) => (s.avgCostTicks === null ? "-" : s.avgCostTicks.toFixed(1)));
   row("average swing between calls (points)", (s) => (s.meanSwing === null ? "-" : (s.meanSwing * 100).toFixed(0)));
   for (const [i, [label]] of BUCKETS.entries()) {
-    row(`P(up) ${label}: calls, past 5m -> next 5m`, (s) => { const b = s.buckets[i]!; return b.calls ? `${b.calls}: ${num(b.past5, 1)} -> ${num(b.next5, 1)}` : "-"; });
+    row(`P(up) ${label}: calls, past ${H}m -> next ${H}m`, (s) => { const b = s.buckets[i]!; return b.calls ? `${b.calls}: ${num(b.past5, 1)} -> ${num(b.next5, 1)}` : "-"; });
   }
   console.log(`\n  A model worth trading shows: strong calls capturing clearly more ticks than the round trip cost, a positive`);
   console.log(`  NEXT correlation, and next-5m moves that rise with P(up). One session is noise; compare several.`);

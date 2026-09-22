@@ -17,7 +17,7 @@ export function targetFromProbability(pUp: number, current: number, p: PolicyPar
 }
 
 /** Policy shaping between the model and the risk gates, to stop acting on noise. */
-export type Shape = "confirm" | "no-flip" | "min-hold";
+export type Shape = "confirm" | "no-flip" | "min-hold" | "chase";
 
 /** Average of the last `n` readings, or null until there are `n` of them. */
 export function smoothed(readings: number[], n: number): number | null {
@@ -39,6 +39,16 @@ export function shapeTarget(wanted: number, current: number, o: { allowFlip: boo
   const shrinks = current !== 0 && (Math.sign(target) !== Math.sign(current) || Math.abs(target) < Math.abs(current));
   if (shrinks && o.heldMs !== null && o.heldMs < o.minHoldMs) return { target: current, shape: "min-hold" };
   return { target, shape };
+}
+
+/**
+ * Chase filter: a target that opens or adds risk in the direction of `moveSigma` (the recent move in units of its
+ * typical size) is held back when that move is already larger than `limit`. Reductions and exits pass. limit 0 = off.
+ */
+export function chaseFilter(target: number, current: number, moveSigma: number | null, limit: number): { target: number; chased: boolean } {
+  if (!limit || moveSigma === null || !addsRisk(target, current)) return { target, chased: false };
+  if (Math.sign(target) * moveSigma <= limit) return { target, chased: false };
+  return { target: reduceOnly(target, current), chased: true };
 }
 
 /** Why the target was changed from what the model asked for. Order of precedence is the order checked. */

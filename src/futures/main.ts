@@ -6,7 +6,7 @@
  *   FUT_EXEC=ibkr  bun run futures    orders to IBKR; paper unless IB_LIVE=true and IB_PORT is a live port
  */
 import { appendFileSync, mkdirSync } from "node:fs";
-import { futuresConfig as cfg } from "./config";
+import { exitsLine, futuresConfig as cfg } from "./config";
 import { formatPrice, SPECS } from "./contracts";
 import { IbkrExecution } from "./ibkr/execution";
 import { IbkrMarketData } from "./ibkr/marketData";
@@ -60,6 +60,7 @@ for (const root of cfg.roots) {
 const mode = cfg.exec === "sim" ? "SIM (no orders sent)" : isPaperPort(ibConfig.port) ? "IBKR PAPER" : "IBKR LIVE";
 console.log(`futures · ${mode} · model=${model.name} · roots ${cfg.roots.join(",")} · every ${cfg.decisionSeconds}s · horizon ${cfg.horizonMinutes}m · qty ${cfg.qty} max ${cfg.maxContracts} · daily loss $${cfg.dailyLossUsd} · :${cfg.port}`);
 console.log(`policy · enter ${cfg.enterProb} · flat band ${cfg.flatBand} · average of ${cfg.smoothN} · min hold ${cfg.minHoldMinutes}m · flips ${cfg.allowFlip ? "allowed" : "go flat first"} · model input ${cfg.stateVersion} · logs data/${cfg.logName}-{events,decisions,fills}.jsonl`);
+console.log(`exits: ${exitsLine(cfg, cfg.roots)}`);
 
 // Startup data check: say plainly what is flowing per root, and what the bot does if it is not.
 setTimeout(() => {

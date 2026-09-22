@@ -32,6 +32,7 @@ const cfg: FuturesConfig = {
   smoothN: 1, minHoldMinutes: 0, allowFlip: true,
   slipTicks: 0, maxSpreadTicks: 2, stopTicks: () => 16, dailyLossUsd: 10_000, entryCutoffMinutes: 10, flattenBeforeWeekendMinutes: 15,
   reconcileEveryCycles: 1_000, orderTimeoutMs: 30_000, depthRows: 0,
+  chaseSigma: 0, chaseMinutes: 5, takeProfitTicks: () => 0, trailStartTicks: () => 0, trailTicks: () => 0, entryMode: "cross", passiveCycles: 2,
 };
 const base = (dataDir: string, over: Partial<BacktestOptions> = {}): BacktestOptions => ({
   dataDir, roots: ["MES"], cfg, model: new ConstModel(0.9), latencyMs: 250, respectSize: false, warmupMinutes: 1, staleMs: 120_000, ...over,

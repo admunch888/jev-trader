@@ -19,12 +19,14 @@
  * Strategy settings come from the same FUT_* variables as the live trader; these flags override the common ones:
  *   --decision-s --horizon-min --enter --flat-band --qty --max-contracts --stop-ticks --daily-loss --max-spread --slip-ticks
  *   --smooth <n> --min-hold <min> --allow-flip / --no-flip
+ *   --chase <sigma> --chase-min <min> --tp <ticks> --trail-start <ticks> --trail <ticks> --entry cross|passive --passive-cycles <n>
+ *   (--tp, --trail-start and --trail apply to every root in the run)
  */
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { futuresConfig, type FuturesConfig } from "../config";
+import { exitsLine, futuresConfig, type FuturesConfig } from "../config";
 import { SPECS } from "../contracts";
 import { createFuturesModel } from "../model";
 import type { Root } from "../types";
@@ -64,6 +66,13 @@ const { values: a } = parseArgs({
     "daily-loss": { type: "string" },
     "max-spread": { type: "string" },
     "slip-ticks": { type: "string" },
+    chase: { type: "string" },
+    "chase-min": { type: "string" },
+    tp: { type: "string" },
+    "trail-start": { type: "string" },
+    trail: { type: "string" },
+    entry: { type: "string" },
+    "passive-cycles": { type: "string" },
   },
 });
 
@@ -73,6 +82,7 @@ const roots = (a.roots ?? futuresConfig.roots.join(",")).split(",").map((s) => s
 for (const r of roots) if (!(r in SPECS)) throw new Error(`unknown root ${r}`);
 
 const stopTicks = num(a["stop-ticks"]);
+const perRoot = (v: number | undefined, d: (r: Root) => number) => (v === undefined ? d : () => v);
 const cfg: FuturesConfig = {
   ...futuresConfig,
   roots,
@@ -90,6 +100,13 @@ const cfg: FuturesConfig = {
   smoothN: pick(num(a.smooth), futuresConfig.smoothN),
   minHoldMinutes: pick(num(a["min-hold"]), futuresConfig.minHoldMinutes),
   allowFlip: a["allow-flip"] ? true : a["no-flip"] ? false : futuresConfig.allowFlip,
+  chaseSigma: pick(num(a.chase), futuresConfig.chaseSigma),
+  chaseMinutes: pick(num(a["chase-min"]), a["horizon-min"] ? Number(a["horizon-min"]) : futuresConfig.chaseMinutes),
+  takeProfitTicks: perRoot(num(a.tp), futuresConfig.takeProfitTicks),
+  trailStartTicks: perRoot(num(a["trail-start"]), futuresConfig.trailStartTicks),
+  trailTicks: perRoot(num(a.trail), futuresConfig.trailTicks),
+  entryMode: a.entry === "passive" ? "passive" : a.entry === "cross" ? "cross" : futuresConfig.entryMode,
+  passiveCycles: pick(num(a["passive-cycles"]), futuresConfig.passiveCycles),
 };
 if (cfg.qty > cfg.maxContracts) throw new Error(`--qty ${cfg.qty} is above --max-contracts ${cfg.maxContracts}`);
 
@@ -137,6 +154,7 @@ if (replayModel) {
   console.log(`  replay: ${rm.hits} cycles used a logged answer, ${rm.misses} had none within ${cfg.decisionSeconds * 2}s and held`);
 }
 console.log(`  policy: enter ${cfg.enterProb}, flat band ${cfg.flatBand}, average of ${cfg.smoothN}, min hold ${cfg.minHoldMinutes}m, flips ${cfg.allowFlip ? "allowed" : "flat first"}`);
+console.log(`  exits and entries: ${exitsLine(cfg, roots)}`);
 const out = a.out ?? join("data", "backtests", new Date().toISOString().replace(/[:.]/g, "-"));
 writeReport(out, result, summary);
 console.log(`report: ${out}/summary.json, trades.csv, equity.csv, cycles.jsonl`);

@@ -157,7 +157,7 @@ export async function runBacktest(o: BacktestOptions): Promise<BacktestResult> {
 
   const { model: _m, modelFactory: _f, onDay, log: _log, cfg, ...rest } = o;
   return {
-    options: { ...rest, model: model.name, cfg: { ...cfg, stopTicks: Object.fromEntries(roots.map((r) => [r, cfg.stopTicks(r)])) } },
+    options: { ...rest, model: model.name, cfg: { ...cfg, ...Object.fromEntries((["stopTicks", "takeProfitTicks", "trailStartTicks", "trailTicks"] as const).map((k) => [k, Object.fromEntries(roots.map((r) => [r, cfg[k](r)]))])) } },
     files, records, events, fills, skipped, marks, startTs, endTs: clock, wallMs: Math.round(performance.now() - t0),
   };
 }
