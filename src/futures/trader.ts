@@ -61,6 +61,8 @@ export interface DecisionRecord {
   root: Root;
   contract: string;
   model: string;
+  /** The exact version that answered, when the model reports one. */
+  modelVersion?: string;
   state: FuturesTradeState;
   probabilities: Record<Action, number>;
   action: Action;
@@ -238,7 +240,7 @@ export class FuturesTrader {
       const state = this.buildState(now, book, gates);
       const d = await this.decide(state);
       if (d) {
-        this.d.onDecision?.({ ts: now.getTime(), root: this.d.root, contract: this.contract.code, model: this.d.model.name, state, probabilities: d.probabilities, action: d.action, latencyMs: Math.round(d.latencyMs) });
+        this.d.onDecision?.({ ts: now.getTime(), root: this.d.root, contract: this.contract.code, model: this.d.model.name, ...(d.modelVersion ? { modelVersion: d.modelVersion } : {}), state, probabilities: d.probabilities, action: d.action, latencyMs: Math.round(d.latencyMs) });
         this.readings.push(d.probabilities.buy);
         if (this.readings.length > Math.max(1, cfg.smoothN)) this.readings.shift();
         const up = smoothed(this.readings, Math.max(1, cfg.smoothN));

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { corr, scoreCalls, type Call, type Series } from "./analyze";
+import { calibrate, corr, scoreCalls, type Call, type Series } from "./analyze";
 
 // A price path in ticks of 1: up to minute 20, down to minute 40, then up again.
 const t0 = 1_000_000;
@@ -37,5 +37,35 @@ describe("scoreCalls", () => {
   test("corr", () => {
     expect(corr([1, 2, 3], [2, 4, 6])).toBeCloseTo(1, 9);
     expect(corr([1, 2], [1, 2])).toBeNull();
+  });
+});
+
+describe("calibrate", () => {
+  // Deterministic pseudo-random numbers so the test is stable.
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+
+  test("well calibrated probabilities: small error, slope near 1, positive skill", () => {
+    const ps: number[] = [], ys: number[] = [];
+    for (let i = 0; i < 20_000; i++) { const p = 0.1 + 0.8 * rnd(); ps.push(p); ys.push(rnd() < p ? 1 : 0); }
+    const c = calibrate(ps, ys)!;
+    expect(c.ece).toBeLessThan(0.02);
+    expect(c.fit!.b).toBeGreaterThan(0.9);
+    expect(c.fit!.b).toBeLessThan(1.1);
+    expect(c.brierSkill).toBeGreaterThan(0.1);
+  });
+
+  test("confident but uninformative: big error, slope near 0, no skill", () => {
+    const ps: number[] = [], ys: number[] = [];
+    for (let i = 0; i < 20_000; i++) { ps.push(rnd() < 0.5 ? 0.8 : 0.2); ys.push(rnd() < 0.5 ? 1 : 0); }
+    const c = calibrate(ps, ys)!;
+    expect(c.ece).toBeGreaterThan(0.25);
+    expect(Math.abs(c.fit!.b)).toBeLessThan(0.05);
+    expect(c.brierSkill).toBeLessThan(0);
+    expect(c.bins.map((b) => b.lo)).toEqual([0.2, 0.8]);
+  });
+
+  test("needs at least 10 outcomes", () => {
+    expect(calibrate([0.6, 0.7], [1, 0])).toBeNull();
   });
 });

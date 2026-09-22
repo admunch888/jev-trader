@@ -7,6 +7,10 @@
  * past and a low next), average move after each probability level, and what strong calls captured per call
  * against the round trip cost. With several logs it compares them over the time they overlap (so both face the
  * same market) unless --all-times. Needs the ticks recorded for those times (`bun run record`).
+ *
+ * Calibration: does P(up) = 0.7 come true about 70% of the time? A reliability table by probability level, Brier
+ * score against always answering the base rate, log loss, expected calibration error, and a fitted recalibration
+ * (logistic on the log-odds): slope 1 means well calibrated, below 1 overconfident, near 0 no information at all.
  */
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
@@ -27,6 +31,73 @@ export interface CallStats {
   avgCostTicks: number | null;
   meanSwing: number | null;
   buckets: { label: string; calls: number; past5: number; next5: number }[];
+  calibration: Calibration | null;
+}
+
+export interface Calibration {
+  /** Calls whose mid moved over the horizon (ties are left out: neither up nor down). */
+  n: number;
+  ties: number;
+  /** Share of those that ended higher. */
+  baseRate: number;
+  brier: number;
+  /** Brier of always answering the base rate; the model must beat it to add anything. */
+  brierBase: number;
+  /** 1 - brier / brierBase: above 0 is better than the base rate, 0 or below adds nothing. */
+  brierSkill: number;
+  logLoss: number;
+  /** Expected calibration error over 10 bins: average gap between stated P(up) and how often it came true. */
+  ece: number;
+  /** P(true up) = sigmoid(a + b * logit(P(up))), fitted on these calls. */
+  fit: { a: number; b: number } | null;
+  bins: { lo: number; hi: number; n: number; meanP: number; freqUp: number }[];
+}
+
+const clip = (p: number) => Math.min(1 - 1e-6, Math.max(1e-6, p));
+const logit = (p: number) => Math.log(clip(p) / (1 - clip(p)));
+const sigmoid = (z: number) => 1 / (1 + Math.exp(-z));
+
+/** How well stated probabilities match outcomes. `ys` are 1 (went up) or 0; null with under 10 outcomes. */
+export function calibrate(ps: number[], ys: number[], ties = 0): Calibration | null {
+  const n = ps.length;
+  if (n < 10) return null;
+  const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  const base = mean(ys);
+  const brier = mean(ps.map((p, i) => (p - ys[i]!) ** 2));
+  const brierBase = base * (1 - base);
+  const logLoss = mean(ps.map((p, i) => -(ys[i]! * Math.log(clip(p)) + (1 - ys[i]!) * Math.log(1 - clip(p)))));
+  const bins: Calibration["bins"] = [];
+  let ece = 0;
+  for (let k = 0; k < 10; k++) {
+    const lo = k / 10, hi = (k + 1) / 10;
+    const idx = ps.map((p, i) => [p, i] as const).filter(([p]) => p >= lo && (k === 9 ? p <= hi : p < hi)).map(([, i]) => i);
+    if (!idx.length) continue;
+    const meanP = mean(idx.map((i) => ps[i]!)), freqUp = mean(idx.map((i) => ys[i]!));
+    bins.push({ lo, hi, n: idx.length, meanP, freqUp });
+    ece += (idx.length / n) * Math.abs(meanP - freqUp);
+  }
+  return {
+    n, ties, baseRate: base, brier, brierBase, brierSkill: brierBase ? 1 - brier / brierBase : 0, logLoss, ece,
+    fit: fitLogistic(ps.map(logit), ys), bins,
+  };
+}
+
+/** Two-parameter logistic regression by Newton's method, with a little ridge so it settles on degenerate data. */
+function fitLogistic(xs: number[], ys: number[]): { a: number; b: number } | null {
+  let a = 0, b = 1;
+  for (let it = 0; it < 50; it++) {
+    let ga = 0, gb = 0, haa = 1e-6, hab = 0, hbb = 1e-6;
+    for (let i = 0; i < xs.length; i++) {
+      const x = xs[i]!, p = sigmoid(a + b * x), w = p * (1 - p), e = p - ys[i]!;
+      ga += e; gb += e * x + 1e-3 * b; haa += w; hab += w * x; hbb += w * x * x + 1e-3;
+    }
+    const det = haa * hbb - hab * hab;
+    if (!(Math.abs(det) > 1e-12)) return null;
+    const da = (hbb * ga - hab * gb) / det, db = (haa * gb - hab * ga) / det;
+    a -= da; b -= db;
+    if (Math.abs(da) + Math.abs(db) < 1e-9) break;
+  }
+  return Number.isFinite(a) && Number.isFinite(b) ? { a, b } : null;
 }
 
 const BUCKETS: [string, number, number][] = [["<=20%", 0, 0.2], ["20-35%", 0.2, 0.35], ["35-65%", 0.35, 0.65], ["65-80%", 0.65, 0.8], [">=80%", 0.8, 1.01]];
@@ -68,6 +139,10 @@ export function scoreCalls(calls: Call[], mids: Map<string, Series>, tick: numbe
       const b = rows.filter((r) => r.up >= lo && r.up < hi);
       return { label, calls: b.length, past5: mean(b.map((r) => r.past5)) ?? 0, next5: mean(b.map((r) => r.f5)) ?? 0 };
     }),
+    calibration: (() => {
+      const moved = rows.filter((r) => r.f5 !== 0);
+      return calibrate(moved.map((r) => r.up), moved.map((r) => (r.f5 > 0 ? 1 : 0)), rows.length - moved.length);
+    })(),
   };
 }
 
@@ -149,6 +224,24 @@ if (import.meta.main) {
   for (const [i, [label]] of BUCKETS.entries()) {
     row(`P(up) ${label}: calls, past ${H}m -> next ${H}m`, (s) => { const b = s.buckets[i]!; return b.calls ? `${b.calls}: ${num(b.past5, 1)} -> ${num(b.next5, 1)}` : "-"; });
   }
+  console.log(`\n  Calibration: P(up) against how often the mid was higher after ${H} min (ties left out)`);
+  const cal = (f: (c: Calibration) => string) => (s: CallStats) => (s.calibration ? f(s.calibration) : "too few");
+  row("calls that moved (ties)", cal((c) => `${c.n} (${c.ties})`));
+  row("went up (base rate)", cal((c) => pct(c.baseRate)));
+  row("Brier (base rate alone) skill", cal((c) => `${c.brier.toFixed(4)} (${c.brierBase.toFixed(4)}) ${num(c.brierSkill, 3)}`));
+  row("log loss (0.693 = coin flip)", cal((c) => c.logLoss.toFixed(3)));
+  row("calibration error (ECE)", cal((c) => `${(c.ece * 100).toFixed(1)} pts`));
+  row("recalibration slope (1 good, 0 no info)", cal((c) => (c.fit ? `${c.fit.b.toFixed(2)} (shift ${num(c.fit.a, 2)})` : "-")));
+  for (let k = 0; k < 10; k++) {
+    const lo = k / 10;
+    if (!stats.some((x) => x.s.calibration?.bins.some((b) => b.lo === lo))) continue;
+    row(`  said ${Math.round(lo * 100)}-${Math.round(lo * 100 + 10)}%: calls, avg said -> came true`, cal((c) => {
+      const b = c.bins.find((x) => x.lo === lo);
+      return b ? `${b.n}: ${pct(b.meanP)} -> ${pct(b.freqUp)}` : "-";
+    }));
+  }
+  console.log(`  Note: Jev is asked whether the mid will be higher by more than the cost, so its P(up) should sit nearer 50% than`);
+  console.log(`  a plain up/down probability would; the slope and Brier skill are the fair tests.`);
   console.log(`\n  A model worth trading shows: strong calls capturing clearly more ticks than the round trip cost, a positive`);
   console.log(`  NEXT correlation, and next-5m moves that rise with P(up). One session is noise; compare several.`);
 }

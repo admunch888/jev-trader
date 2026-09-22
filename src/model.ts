@@ -32,6 +32,8 @@ export interface Decision {
   upIn10: number;
   latencyMs: number;
   inputTokens: number;
+  /** The exact model version that answered (an alias like jev-latest resolves to one), when the provider reports it. */
+  modelVersion?: string;
 }
 
 /** Generic over the state it reads, so the futures loop can reuse the same models with its own state. */
@@ -69,8 +71,12 @@ const QUESTIONS: DirectionQuestions = {
 export class JevModel<S = TradeState> implements Model<S> {
   readonly name = config.jevModelId;
   private model = typeSafeAi.evaluationModel(config.jevModelId);
+  /** The version that answered first; a later answer from a different one means the alias moved mid-run. */
+  private version: string | null = null;
 
-  constructor(private questions: DirectionQuestions = QUESTIONS) {}
+  constructor(private questions: DirectionQuestions = QUESTIONS, private log: (msg: string) => void = console.warn) {
+    if (/latest/i.test(config.jevModelId)) this.log(`JEV_MODEL_ID=${config.jevModelId} is an alias: a new Jev version can replace it without notice. Pin a version for tests.`);
+  }
 
   async decide(state: S): Promise<Decision> {
     const t0 = performance.now();
@@ -78,12 +84,19 @@ export class JevModel<S = TradeState> implements Model<S> {
     const a = r.answers.direction;
     const p = a.probabilities ?? { buy: 0, sell: 0, [a.choice]: 1 };
     const buy = p.buy ?? 0, sell = p.sell ?? 0;
+    const modelVersion = r.response?.modelId;
+    if (modelVersion && modelVersion !== this.version) {
+      if (this.version) this.log(`WARNING: Jev version changed from ${this.version} to ${modelVersion}; thresholds were set on the old one`);
+      else this.log(`Jev answering as ${modelVersion}`);
+      this.version = modelVersion;
+    }
     return {
       action: a.choice as Action,
       probabilities: { buy, sell, hold: 0 },
       upIn10: buy,
       latencyMs: performance.now() - t0,
       inputTokens: r.usage?.inputTokens ?? 0,
+      ...(modelVersion ? { modelVersion } : {}),
     };
   }
 }
