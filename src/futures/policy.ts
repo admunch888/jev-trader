@@ -1,0 +1,127 @@
+/**
+ * Decision policy and risk limits, kept pure so they can be tested without a broker.
+ *
+ * The model answers buy or sell with a probability. `targetFromProbability` turns that into a target position
+ * in contracts: long or short past `enter`, flat inside `flatBand` of 50/50, otherwise keep what we have (so a
+ * wavering model does not churn). `clampTarget` then applies the risk gates, which can only move the target
+ * toward flat, never away from it.
+ */
+
+export interface PolicyParams { enterProb: number; flatBand: number; qty: number }
+
+export function targetFromProbability(pUp: number, current: number, p: PolicyParams): number {
+  if (pUp >= p.enterProb) return p.qty;
+  if (pUp <= 1 - p.enterProb) return -p.qty;
+  if (Math.abs(pUp - 0.5) <= p.flatBand) return 0;
+  return current;
+}
+
+/** Policy shaping between the model and the risk gates, to stop acting on noise. */
+export type Shape = "confirm" | "no-flip" | "min-hold" | "chase";
+
+/** Average of the last `n` readings, or null until there are `n` of them. */
+export function smoothed(readings: number[], n: number): number | null {
+  if (readings.length < n) return null;
+  const last = readings.slice(-n);
+  return last.reduce((a, b) => a + b, 0) / n;
+}
+
+/**
+ * Shape the model's target before the risk gates:
+ *   no-flip   a target on the other side becomes flat (unless flips are allowed)
+ *   min-hold  a position younger than `minHoldMs` is not shrunk or reversed by the model
+ * Adding to a position is never blocked here (max contracts and the risk gates handle size).
+ */
+export function shapeTarget(wanted: number, current: number, o: { allowFlip: boolean; heldMs: number | null; minHoldMs: number }): { target: number; shape: Shape | null } {
+  let target = wanted;
+  let shape: Shape | null = null;
+  if (!o.allowFlip && current !== 0 && target !== 0 && Math.sign(target) !== Math.sign(current)) { target = 0; shape = "no-flip"; }
+  const shrinks = current !== 0 && (Math.sign(target) !== Math.sign(current) || Math.abs(target) < Math.abs(current));
+  if (shrinks && o.heldMs !== null && o.heldMs < o.minHoldMs) return { target: current, shape: "min-hold" };
+  return { target, shape };
+}
+
+/**
+ * Chase filter: a target that opens or adds risk in the direction of `moveSigma` (the recent move in units of its
+ * typical size) is held back when that move is already larger than `limit`. Reductions and exits pass. limit 0 = off.
+ */
+export function chaseFilter(target: number, current: number, moveSigma: number | null, limit: number): { target: number; chased: boolean } {
+  if (!limit || moveSigma === null || !addsRisk(target, current)) return { target, chased: false };
+  if (Math.sign(target) * moveSigma <= limit) return { target, chased: false };
+  return { target: reduceOnly(target, current), chased: true };
+}
+
+/** Why the target was changed from what the model asked for. Order of precedence is the order checked. */
+export type Gate =
+  | "broker" // order connection down: nothing can be sent, hold
+  | "halted" // daily loss limit, flatten
+  | "roll" // contract past its roll date, flatten
+  | "weekend" // close to the weekend close, flatten
+  | "stop-breached" // price is through where the stop would sit, flatten
+  | "closed" // session closed, do nothing
+  | "no-new-risk" // entry cutoff, wide spread or delayed data: exits only
+  | "max-contracts";
+
+export interface Gates {
+  brokerDown: boolean;
+  halted: boolean;
+  roll: boolean;
+  weekend: boolean;
+  stopBreached: boolean;
+  closed: boolean;
+  /** Reasons new risk is blocked right now; empty means allowed. */
+  noNewRisk: string[];
+  maxContracts: number;
+}
+
+export function clampTarget(target: number, current: number, g: Gates): { target: number; gate: Gate | null; detail?: string } {
+  if (g.brokerDown) return { target: current, gate: "broker" };
+  if (g.halted) return { target: 0, gate: "halted" };
+  if (g.roll) return { target: 0, gate: "roll" };
+  if (g.weekend) return { target: 0, gate: "weekend" };
+  if (g.stopBreached) return { target: 0, gate: "stop-breached" };
+  if (g.closed) return { target: current, gate: "closed" };
+  if (g.noNewRisk.length && addsRisk(target, current)) {
+    return { target: reduceOnly(target, current), gate: "no-new-risk", detail: g.noNewRisk.join(", ") };
+  }
+  if (Math.abs(target) > g.maxContracts) return { target: Math.sign(target) * g.maxContracts, gate: "max-contracts" };
+  return { target, gate: null };
+}
+
+/** True when moving from `current` to `target` increases exposure or opens the other side. */
+export const addsRisk = (target: number, current: number) =>
+  target !== 0 && (Math.sign(target) !== Math.sign(current) || Math.abs(target) > Math.abs(current));
+
+/** The part of a move that only reduces: flips and adds become flat or unchanged. */
+export function reduceOnly(target: number, current: number) {
+  if (target === 0 || Math.sign(target) !== Math.sign(current)) return 0;
+  return Math.sign(target) * Math.min(Math.abs(target), Math.abs(current));
+}
+
+/**
+ * Account-wide daily loss limit across all roots. Each trader reports its PnL for the current trading day; once
+ * the sum reaches -limit every trader flattens and stays flat until the trading day changes.
+ */
+export class RiskGuard {
+  private pnl = new Map<string, number>();
+  private day: string | null = null;
+  private haltedReason: string | null = null;
+
+  constructor(private readonly dailyLossUsd: number) {}
+
+  report(root: string, tradingDay: string, pnlTodayUsd: number) {
+    if (tradingDay !== this.day) {
+      this.day = tradingDay;
+      this.pnl.clear();
+      this.haltedReason = null;
+    }
+    this.pnl.set(root, pnlTodayUsd);
+    const total = this.totalToday;
+    if (!this.haltedReason && total <= -this.dailyLossUsd) {
+      this.haltedReason = `daily loss $${(-total).toFixed(2)} reached the $${this.dailyLossUsd} limit on ${tradingDay}`;
+    }
+  }
+
+  get totalToday() { let t = 0; for (const v of this.pnl.values()) t += v; return t; }
+  get halted() { return this.haltedReason; }
+}

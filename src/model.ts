@@ -32,14 +32,26 @@ export interface Decision {
   upIn10: number;
   latencyMs: number;
   inputTokens: number;
+  /** The exact model version that answered (an alias like jev-latest resolves to one), when the provider reports it. */
+  modelVersion?: string;
 }
 
-export interface Model {
+/** Generic over the state it reads, so the futures loop can reuse the same models with its own state. */
+export interface Model<S = TradeState> {
   readonly name: string;
-  decide(state: TradeState): Promise<Decision>;
+  decide(state: S): Promise<Decision>;
 }
 
-const QUESTIONS = {
+/** One two-way choice, `direction`: buy or sell. The instructions are what differ between markets. */
+export type DirectionQuestions = {
+  readonly direction: {
+    readonly type: "choice";
+    readonly instructions: Readonly<Record<string, string>>;
+    readonly criteria: { readonly buy: string; readonly sell: string };
+  };
+};
+
+const QUESTIONS: DirectionQuestions = {
   direction: {
     type: "choice",
     instructions: {
@@ -53,25 +65,38 @@ const QUESTIONS = {
       sell: "Sell MON now: mid more likely to be lower after `horizonBlocks` blocks, by more than the spread.",
     },
   },
-} as const;
+};
 
 /** Real Jev via the AI SDK. Swap-in is the MODEL env var. */
-export class JevModel implements Model {
+export class JevModel<S = TradeState> implements Model<S> {
   readonly name = config.jevModelId;
   private model = typeSafeAi.evaluationModel(config.jevModelId);
+  /** The version that answered first; a later answer from a different one means the alias moved mid-run. */
+  private version: string | null = null;
 
-  async decide(state: TradeState): Promise<Decision> {
+  constructor(private questions: DirectionQuestions = QUESTIONS, private log: (msg: string) => void = console.warn) {
+    if (/latest/i.test(config.jevModelId)) this.log(`JEV_MODEL_ID=${config.jevModelId} is an alias: a new Jev version can replace it without notice. Pin a version for tests.`);
+  }
+
+  async decide(state: S): Promise<Decision> {
     const t0 = performance.now();
-    const r = await experimental_evaluate({ model: this.model, state: state as any, questions: QUESTIONS, maxRetries: 0 });
+    const r = await experimental_evaluate({ model: this.model, state: state as any, questions: this.questions, maxRetries: 0 });
     const a = r.answers.direction;
     const p = a.probabilities ?? { buy: 0, sell: 0, [a.choice]: 1 };
     const buy = p.buy ?? 0, sell = p.sell ?? 0;
+    const modelVersion = r.response?.modelId;
+    if (modelVersion && modelVersion !== this.version) {
+      if (this.version) this.log(`WARNING: Jev version changed from ${this.version} to ${modelVersion}; thresholds were set on the old one`);
+      else this.log(`Jev answering as ${modelVersion}`);
+      this.version = modelVersion;
+    }
     return {
       action: a.choice as Action,
       probabilities: { buy, sell, hold: 0 },
       upIn10: buy,
       latencyMs: performance.now() - t0,
       inputTokens: r.usage?.inputTokens ?? 0,
+      ...(modelVersion ? { modelVersion } : {}),
     };
   }
 }

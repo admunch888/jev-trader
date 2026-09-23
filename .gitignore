@@ -1,3 +1,7 @@
 node_modules
 .env
 data/
+
+# Local market data exports (hundreds of MB), not for the repo
+histdata/
+.DS_Store
