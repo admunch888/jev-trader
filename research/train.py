@@ -101,8 +101,36 @@ def filtered(market):
                 hit = float(((p[sel] > 0.5) == (te[col][sel] > 0)).mean())
                 print(f"{year:>10} {label:>22} {int(sel.sum()):>8,} {hit:>8.1%} {got:>15.2f} {got - cost:>11.2f}")
 
+def long(market):
+    """
+    Longer horizons with a cost-aware target: what would a trade actually make, held to a profit target, a stop
+    (both one expected move away) or the horizon? The model predicts that number in ticks; trades are then
+    simulated in time order, never overlapping, so the count is what could really have been traded.
+    """
+    df, feats = load(market)
+    cost = COST_TICKS[market]
+    for h in (60, 120, 240):
+        col, hitmin = f"y_exit{h}", f"y_hitmin{h}"
+        d = df.dropna(subset=[col])
+        print(f"\n{market}: {h} minute horizon, profit target and stop one expected move away "
+              f"(median {d[f'y_barrier{h}'].median():.0f} ticks), cost {cost} ticks a trade")
+        print(f"{'test year':>10} {'enter when predicted >':>23} {'trades':>7} {'won':>6} {'ticks/trade':>12} {'total ticks':>12} {'t':>6}")
+        for year, tr, te in folds(d):
+            m, pred = fit(tr, te, feats, lambda x: x[col].clip(-3 * x[f"y_barrier{h}"], 3 * x[f"y_barrier{h}"]), "regression")
+            for thr in (cost, 2 * cost, 4 * cost):
+                # walk forward in time, one trade at a time
+                nets, free_from = [], pd.Timestamp.min
+                for ts, p, exit_ticks, held in zip(te.index, pred, te[col].to_numpy(), te[hitmin].to_numpy()):
+                    if ts < free_from or abs(p) < thr: continue
+                    nets.append(np.sign(p) * exit_ticks - cost)
+                    free_from = ts + pd.Timedelta(minutes=float(held))
+                if len(nets) < 10: continue
+                a = np.array(nets)
+                t = a.mean() / (a.std(ddof=1) / np.sqrt(len(a)))
+                print(f"{year:>10} {thr:>23.1f} {len(a):>7,} {(a > 0).mean():>5.0%} {a.mean():>12.2f} {a.sum():>12,.0f} {t:>6.2f}")
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("market"); ap.add_argument("task", choices=["move", "direction", "filtered"])
+    ap.add_argument("market"); ap.add_argument("task", choices=["move", "direction", "filtered", "long"])
     a = ap.parse_args()
-    {"move": move, "direction": direction, "filtered": filtered}[a.task](a.market)
+    {"move": move, "direction": direction, "filtered": filtered, "long": long}[a.task](a.market)
